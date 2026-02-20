@@ -783,6 +783,217 @@ template = "tg_default"
 	if cfg.Notify.Queue.MaxAckPending <= 0 {
 		t.Fatalf("expected positive queue max ack pending, got %d", cfg.Notify.Queue.MaxAckPending)
 	}
+	if cfg.Notify.Queue.DLQ.Subject != "alerting.notify.jobs.dlq" {
+		t.Fatalf("unexpected queue dlq subject %q", cfg.Notify.Queue.DLQ.Subject)
+	}
+	if cfg.Notify.Queue.DLQ.Stream != "ALERTING_NOTIFY_DLQ" {
+		t.Fatalf("unexpected queue dlq stream %q", cfg.Notify.Queue.DLQ.Stream)
+	}
+}
+
+func TestLoadSnapshotAcceptsEnabledNotifyQueueDLQ(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.toml")
+	content := `
+[service]
+name = "alerting"
+
+[ingest.http]
+enabled = true
+
+[notify.queue]
+enabled = true
+url = "nats://127.0.0.1:4222"
+subject = "alerting.notify.jobs.test"
+stream = "ALERTING_NOTIFY_TEST"
+consumer_name = "alerting-notify-test"
+deliver_group = "alerting-notify-test"
+ack_wait_sec = 10
+nack_delay_ms = 100
+max_deliver = 3
+max_ack_pending = 100
+
+[notify.queue.dlq]
+enabled = true
+subject = "alerting.notify.jobs.test.dlq"
+stream = "ALERTING_NOTIFY_TEST_DLQ"
+
+[notify.telegram]
+enabled = true
+bot_token = "token"
+chat_id = "chat"
+
+[[notify.telegram.name-template]]
+name = "tg_default"
+message = "{{ .Message }}"
+
+[rule.ct]
+alert_type = "count_total"
+
+[rule.ct.match]
+type = ["event"]
+var = ["errors"]
+tags = { dc = ["dc1"] }
+
+[rule.ct.key]
+from_tags = ["dc"]
+
+[rule.ct.raise]
+n = 1
+
+[rule.ct.resolve]
+silence_sec = 5
+
+[[rule.ct.notify.route]]
+channel = "telegram"
+template = "tg_default"
+`
+	writeConfigFile(t, path, content)
+
+	cfg, err := LoadSnapshot(ConfigSource{File: path})
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+	if !cfg.Notify.Queue.DLQ.Enabled {
+		t.Fatalf("expected queue dlq enabled")
+	}
+	if cfg.Notify.Queue.DLQ.Subject != "alerting.notify.jobs.test.dlq" {
+		t.Fatalf("unexpected queue dlq subject %q", cfg.Notify.Queue.DLQ.Subject)
+	}
+	if cfg.Notify.Queue.DLQ.Stream != "ALERTING_NOTIFY_TEST_DLQ" {
+		t.Fatalf("unexpected queue dlq stream %q", cfg.Notify.Queue.DLQ.Stream)
+	}
+}
+
+func TestLoadSnapshotRejectsNotifyQueueDLQWhenQueueDisabled(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.toml")
+	content := `
+[service]
+name = "alerting"
+
+[ingest.http]
+enabled = true
+
+[notify.queue]
+enabled = false
+
+[notify.queue.dlq]
+enabled = true
+
+[notify.telegram]
+enabled = true
+bot_token = "token"
+chat_id = "chat"
+
+[[notify.telegram.name-template]]
+name = "tg_default"
+message = "{{ .Message }}"
+
+[rule.ct]
+alert_type = "count_total"
+
+[rule.ct.match]
+type = ["event"]
+var = ["errors"]
+tags = { dc = ["dc1"] }
+
+[rule.ct.key]
+from_tags = ["dc"]
+
+[rule.ct.raise]
+n = 1
+
+[rule.ct.resolve]
+silence_sec = 5
+
+[[rule.ct.notify.route]]
+channel = "telegram"
+template = "tg_default"
+`
+	writeConfigFile(t, path, content)
+
+	_, err := LoadSnapshot(ConfigSource{File: path})
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "notify.queue.dlq.enabled requires notify.queue.enabled=true") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadSnapshotRejectsNotifyQueueDLQSameSubject(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.toml")
+	content := `
+[service]
+name = "alerting"
+
+[ingest.http]
+enabled = true
+
+[notify.queue]
+enabled = true
+url = "nats://127.0.0.1:4222"
+subject = "alerting.notify.jobs.test"
+stream = "ALERTING_NOTIFY_TEST"
+consumer_name = "alerting-notify-test"
+deliver_group = "alerting-notify-test"
+ack_wait_sec = 10
+nack_delay_ms = 100
+max_deliver = 3
+max_ack_pending = 100
+
+[notify.queue.dlq]
+enabled = true
+subject = "alerting.notify.jobs.test"
+stream = "ALERTING_NOTIFY_TEST_DLQ"
+
+[notify.telegram]
+enabled = true
+bot_token = "token"
+chat_id = "chat"
+
+[[notify.telegram.name-template]]
+name = "tg_default"
+message = "{{ .Message }}"
+
+[rule.ct]
+alert_type = "count_total"
+
+[rule.ct.match]
+type = ["event"]
+var = ["errors"]
+tags = { dc = ["dc1"] }
+
+[rule.ct.key]
+from_tags = ["dc"]
+
+[rule.ct.raise]
+n = 1
+
+[rule.ct.resolve]
+silence_sec = 5
+
+[[rule.ct.notify.route]]
+channel = "telegram"
+template = "tg_default"
+`
+	writeConfigFile(t, path, content)
+
+	_, err := LoadSnapshot(ConfigSource{File: path})
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "notify.queue.dlq.subject must differ from notify.queue.subject") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestLoadSnapshotAcceptsEnabledJiraTracker(t *testing.T) {
@@ -1195,6 +1406,127 @@ template = "tg_default"
 		t.Fatalf("expected name field error")
 	}
 	if !strings.Contains(err.Error(), "rule.ct.name is not supported") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadSnapshotAcceptsMessengerDualRoutesWithActiveOnly(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.toml")
+	content := `
+[service]
+name = "alerting"
+
+[ingest.http]
+enabled = true
+
+[notify.telegram]
+enabled = true
+bot_token = "token"
+chat_id = "history-chat"
+active_chat_id = "active-chat"
+
+[[notify.telegram.name-template]]
+name = "tg_history"
+message = "history {{ .State }}"
+
+[[notify.telegram.name-template]]
+name = "tg_active"
+message = "active {{ .State }}"
+
+[rule.ct]
+alert_type = "count_total"
+
+[rule.ct.match]
+type = ["event"]
+var = ["errors"]
+tags = { dc = ["dc1"] }
+
+[rule.ct.key]
+from_tags = ["dc"]
+
+[rule.ct.raise]
+n = 1
+
+[rule.ct.resolve]
+silence_sec = 5
+
+[[rule.ct.notify.route]]
+name = "telegram_history"
+channel = "telegram"
+template = "tg_history"
+mode = "history"
+
+[[rule.ct.notify.route]]
+name = "telegram_active"
+channel = "telegram"
+template = "tg_active"
+mode = "active_only"
+`
+	writeConfigFile(t, path, content)
+
+	cfg, err := LoadSnapshot(ConfigSource{File: path})
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+	if len(cfg.Rule) != 1 || len(cfg.Rule[0].Notify.Route) != 2 {
+		t.Fatalf("unexpected routes: %+v", cfg.Rule)
+	}
+}
+
+func TestLoadSnapshotRejectsActiveOnlyWithoutActiveDestination(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.toml")
+	content := `
+[service]
+name = "alerting"
+
+[ingest.http]
+enabled = true
+
+[notify.telegram]
+enabled = true
+bot_token = "token"
+chat_id = "history-chat"
+
+[[notify.telegram.name-template]]
+name = "tg_active"
+message = "active {{ .State }}"
+
+[rule.ct]
+alert_type = "count_total"
+
+[rule.ct.match]
+type = ["event"]
+var = ["errors"]
+tags = { dc = ["dc1"] }
+
+[rule.ct.key]
+from_tags = ["dc"]
+
+[rule.ct.raise]
+n = 1
+
+[rule.ct.resolve]
+silence_sec = 5
+
+[[rule.ct.notify.route]]
+name = "telegram_active"
+channel = "telegram"
+template = "tg_active"
+mode = "active_only"
+`
+	writeConfigFile(t, path, content)
+
+	_, err := LoadSnapshot(ConfigSource{File: path})
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "active_chat_id") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

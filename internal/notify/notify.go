@@ -61,6 +61,82 @@ type Dispatcher struct {
 	templateErrs map[string]error
 }
 
+// PermanentError marks delivery errors that must not be retried.
+// Params: wrapped root cause.
+// Returns: typed permanent error marker.
+type PermanentError struct {
+	Err error
+}
+
+// Error returns wrapped error message.
+// Params: none.
+// Returns: string representation.
+func (e PermanentError) Error() string {
+	if e.Err == nil {
+		return "permanent notify error"
+	}
+	return e.Err.Error()
+}
+
+// Unwrap exposes wrapped cause for errors.Is/errors.As.
+// Params: none.
+// Returns: wrapped error.
+func (e PermanentError) Unwrap() error {
+	return e.Err
+}
+
+// Permanent marks error as non-retryable.
+// Params: none.
+// Returns: true.
+func (PermanentError) Permanent() bool {
+	return true
+}
+
+// MarkPermanent wraps error with non-retryable marker.
+// Params: source error.
+// Returns: wrapped error or nil.
+func MarkPermanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return PermanentError{Err: err}
+}
+
+// IsPermanent reports whether error is non-retryable.
+// Params: candidate error.
+// Returns: true when permanent marker is present.
+func IsPermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+	type permanent interface {
+		Permanent() bool
+	}
+	var marker permanent
+	if !errors.As(err, &marker) {
+		return false
+	}
+	return marker.Permanent()
+}
+
+var channelSenderFactories = map[string]func(config.NotifyConfig) ChannelSender{
+	config.NotifyChannelTelegram: func(cfg config.NotifyConfig) ChannelSender {
+		return NewTelegramSender(cfg.Telegram)
+	},
+	config.NotifyChannelHTTP: func(cfg config.NotifyConfig) ChannelSender {
+		return NewHTTPScenarioSender(cfg.HTTP)
+	},
+	config.NotifyChannelMattermost: func(cfg config.NotifyConfig) ChannelSender {
+		return NewMattermostSender(cfg.Mattermost)
+	},
+	config.NotifyChannelJira: func(cfg config.NotifyConfig) ChannelSender {
+		return NewTrackerSender(config.NotifyChannelJira, cfg.Jira)
+	},
+	config.NotifyChannelYouTrack: func(cfg config.NotifyConfig) ChannelSender {
+		return NewTrackerSender(config.NotifyChannelYouTrack, cfg.YouTrack)
+	},
+}
+
 // NewDispatcher builds notification dispatcher from enabled channels.
 // Params: global notify config and optional logger.
 // Returns: configured dispatcher with available senders.
@@ -98,20 +174,11 @@ func NewDispatcher(cfg config.NotifyConfig, logger *slog.Logger) *Dispatcher {
 // Params: normalized channel key and full notify config.
 // Returns: channel sender or nil when channel is unknown.
 func newSenderForChannel(channel string, cfg config.NotifyConfig) ChannelSender {
-	switch channel {
-	case config.NotifyChannelTelegram:
-		return NewTelegramSender(cfg.Telegram)
-	case config.NotifyChannelHTTP:
-		return NewHTTPScenarioSender(cfg.HTTP)
-	case config.NotifyChannelMattermost:
-		return NewMattermostSender(cfg.Mattermost)
-	case config.NotifyChannelJira:
-		return NewTrackerSender(config.NotifyChannelJira, cfg.Jira)
-	case config.NotifyChannelYouTrack:
-		return NewTrackerSender(config.NotifyChannelYouTrack, cfg.YouTrack)
-	default:
+	factory := channelSenderFactories[channel]
+	if factory == nil {
 		return nil
 	}
+	return factory(cfg)
 }
 
 // Send sends one notification to channel/template with retry policy.
@@ -120,18 +187,18 @@ func newSenderForChannel(channel string, cfg config.NotifyConfig) ChannelSender 
 func (d *Dispatcher) Send(ctx context.Context, channel, templateName string, notification domain.Notification) (SendResult, error) {
 	sender, ok := d.senders[channel]
 	if !ok {
-		return SendResult{}, fmt.Errorf("notify channel %q is not configured", channel)
+		return SendResult{}, MarkPermanent(fmt.Errorf("notify channel %q is not configured", channel))
 	}
 	compiled, err := d.resolveTemplate(templateName, channel)
 	if err != nil {
-		return SendResult{}, err
+		return SendResult{}, MarkPermanent(err)
 	}
 
 	renderedNotification := notification
 	renderedNotification.Channel = channel
 	renderedMessage, err := d.renderMessage(compiled, renderedNotification)
 	if err != nil {
-		return SendResult{}, err
+		return SendResult{}, MarkPermanent(err)
 	}
 	renderedNotification.Message = renderedMessage
 
@@ -150,19 +217,14 @@ func (d *Dispatcher) sendWithRetry(ctx context.Context, sender ChannelSender, no
 	backoff := time.Duration(retry.InitialMS) * time.Millisecond
 	maxBackoff := time.Duration(retry.MaxMS) * time.Millisecond
 	var timer *time.Timer
+	defer func() {
+		stopAndDrainTimer(timer)
+	}()
 
 	for {
 		attempt++
 		result, err := sender.Send(ctx, notification)
 		if err == nil {
-			if timer != nil {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-			}
 			if retry.LogEachAttempt && attempt > 1 && d.logger != nil {
 				d.logger.Info("notify send recovered after retries", "channel", sender.Channel(), "attempt", attempt)
 			}
@@ -171,40 +233,22 @@ func (d *Dispatcher) sendWithRetry(ctx context.Context, sender ChannelSender, no
 		if retry.LogEachAttempt && d.logger != nil {
 			d.logger.Warn("notify send attempt failed", "channel", sender.Channel(), "attempt", attempt, "error", err.Error())
 		}
+		if IsPermanent(err) {
+			return SendResult{}, err
+		}
 
 		if retry.MaxAttempts > 0 && attempt >= retry.MaxAttempts {
-			if timer != nil {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-			}
 			return SendResult{}, fmt.Errorf("channel %s failed after %d attempts: %w", sender.Channel(), attempt, err)
 		}
 
 		if timer == nil {
 			timer = time.NewTimer(backoff)
 		} else {
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+			stopAndDrainTimer(timer)
 			timer.Reset(backoff)
 		}
 		select {
 		case <-ctx.Done():
-			if timer != nil {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-			}
 			return SendResult{}, ctx.Err()
 		case <-timer.C:
 		}
@@ -215,6 +259,22 @@ func (d *Dispatcher) sendWithRetry(ctx context.Context, sender ChannelSender, no
 				backoff = maxBackoff
 			}
 		}
+	}
+}
+
+// stopAndDrainTimer safely stops timer and drains stale tick when needed.
+// Params: timer pointer that may be nil.
+// Returns: timer stopped/drained best-effort.
+func stopAndDrainTimer(timer *time.Timer) {
+	if timer == nil {
+		return
+	}
+	if timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
 	}
 }
 
@@ -316,9 +376,10 @@ func parseTemplate(name, body string) (*template.Template, error) {
 // Params: bot token, chat id, and base URL.
 // Returns: Telegram channel sender.
 type TelegramSender struct {
-	client  *tgbot.Bot
-	chatID  any
-	initErr error
+	client       *tgbot.Bot
+	chatID       any
+	activeChatID any
+	initErr      error
 }
 
 // NewTelegramSender creates Telegram sender with HTTP client.
@@ -327,6 +388,9 @@ type TelegramSender struct {
 func NewTelegramSender(cfg config.TelegramNotifier) *TelegramSender {
 	sender := &TelegramSender{
 		chatID: normalizeChatID(cfg.ChatID),
+	}
+	if strings.TrimSpace(cfg.ActiveChatID) != "" {
+		sender.activeChatID = normalizeChatID(cfg.ActiveChatID)
 	}
 
 	if strings.TrimSpace(cfg.BotToken) == "" {
@@ -369,8 +433,24 @@ func (s *TelegramSender) Send(ctx context.Context, notification domain.Notificat
 		return SendResult{}, errors.New("telegram client is not initialized")
 	}
 
+	routeMode := config.NormalizeNotifyRouteMode(notification.RouteMode)
+	chatID := s.chatID
+	if routeMode == config.NotifyRouteModeActiveOnly && s.activeChatID != nil {
+		chatID = s.activeChatID
+	}
+
+	if routeMode == config.NotifyRouteModeActiveOnly {
+		return s.sendActiveOnly(ctx, chatID, notification)
+	}
+	return s.sendHistory(ctx, chatID, notification)
+}
+
+// sendHistory sends standard Telegram history notifications.
+// Params: context, target chat id, and payload.
+// Returns: send result with message id.
+func (s *TelegramSender) sendHistory(ctx context.Context, chatID any, notification domain.Notification) (SendResult, error) {
 	request := &tgbot.SendMessageParams{
-		ChatID:    s.chatID,
+		ChatID:    chatID,
 		Text:      notification.Message,
 		ParseMode: tgmodels.ParseModeHTML,
 	}
@@ -388,6 +468,74 @@ func (s *TelegramSender) Send(ctx context.Context, notification domain.Notificat
 		return SendResult{}, errors.New("telegram send returned empty message id")
 	}
 	return SendResult{MessageID: sent.ID}, nil
+}
+
+// sendActiveOnly maintains one active Telegram message per route.
+// Params: context, target chat id, and payload.
+// Returns: message metadata/external ref for create/update/delete lifecycle.
+func (s *TelegramSender) sendActiveOnly(ctx context.Context, chatID any, notification domain.Notification) (SendResult, error) {
+	switch notification.State {
+	case domain.AlertStateResolved:
+		messageID, err := parseTelegramMessageID(notification.ExternalRef)
+		if err != nil {
+			return SendResult{}, fmt.Errorf("telegram active delete: %w", err)
+		}
+		ok, err := s.client.DeleteMessage(ctx, &tgbot.DeleteMessageParams{
+			ChatID:    chatID,
+			MessageID: messageID,
+		})
+		if err != nil {
+			return SendResult{}, fmt.Errorf("telegram delete: %w", err)
+		}
+		if !ok {
+			return SendResult{}, errors.New("telegram delete returned false")
+		}
+		return SendResult{}, nil
+	default:
+		if strings.TrimSpace(notification.ExternalRef) != "" {
+			messageID, err := parseTelegramMessageID(notification.ExternalRef)
+			if err != nil {
+				return SendResult{}, fmt.Errorf("telegram active edit: %w", err)
+			}
+			edited, err := s.client.EditMessageText(ctx, &tgbot.EditMessageTextParams{
+				ChatID:    chatID,
+				MessageID: messageID,
+				Text:      notification.Message,
+				ParseMode: tgmodels.ParseModeHTML,
+			})
+			if err != nil {
+				return SendResult{}, fmt.Errorf("telegram edit: %w", err)
+			}
+			if edited == nil || edited.ID <= 0 {
+				return SendResult{}, errors.New("telegram edit returned empty message")
+			}
+			return SendResult{MessageID: messageID, ExternalRef: strconv.Itoa(messageID)}, nil
+		}
+
+		sent, err := s.client.SendMessage(ctx, &tgbot.SendMessageParams{
+			ChatID:    chatID,
+			Text:      notification.Message,
+			ParseMode: tgmodels.ParseModeHTML,
+		})
+		if err != nil {
+			return SendResult{}, fmt.Errorf("telegram send: %w", err)
+		}
+		if sent == nil || sent.ID <= 0 {
+			return SendResult{}, errors.New("telegram send returned empty message id")
+		}
+		return SendResult{MessageID: sent.ID, ExternalRef: strconv.Itoa(sent.ID)}, nil
+	}
+}
+
+// parseTelegramMessageID parses positive message id from external reference.
+// Params: stored external reference string.
+// Returns: parsed message id or validation error.
+func parseTelegramMessageID(value string) (int, error) {
+	messageID, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || messageID <= 0 {
+		return 0, fmt.Errorf("invalid telegram message id %q", value)
+	}
+	return messageID, nil
 }
 
 // normalizeChatID converts numeric chat IDs to int64 and keeps non-numeric IDs as string.
@@ -432,31 +580,20 @@ func (s *HTTPScenarioSender) Channel() string {
 // Params: context and notification payload.
 // Returns: transport or HTTP error.
 func (s *HTTPScenarioSender) Send(ctx context.Context, notification domain.Notification) (SendResult, error) {
-	body, err := json.Marshal(notification)
-	if err != nil {
-		return SendResult{}, fmt.Errorf("encode http notify payload: %w", err)
-	}
-
 	method := strings.ToUpper(strings.TrimSpace(s.cfg.Method))
 	if method == "" {
 		method = http.MethodPost
 	}
-	request, err := http.NewRequestWithContext(ctx, method, s.cfg.URL, bytes.NewReader(body))
+	request, err := buildJSONRequest(ctx, method, s.cfg.URL, notification, "http notify")
 	if err != nil {
-		return SendResult{}, fmt.Errorf("build http notify request: %w", err)
+		return SendResult{}, err
 	}
-	request.Header.Set("Content-Type", "application/json")
 	for key, value := range s.cfg.Headers {
 		request.Header.Set(key, value)
 	}
 
-	response, err := s.client.Do(request)
-	if err != nil {
-		return SendResult{}, fmt.Errorf("http notify send: %w", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return SendResult{}, unexpectedHTTPStatusError("http notify", response)
+	if _, err := executeRequest(s.client, request, "http notify", nil); err != nil {
+		return SendResult{}, err
 	}
 	return SendResult{}, nil
 }
@@ -494,6 +631,17 @@ func (s *MattermostSender) Channel() string {
 // Params: context and notification payload.
 // Returns: transport or HTTP error.
 func (s *MattermostSender) Send(ctx context.Context, notification domain.Notification) (SendResult, error) {
+	mode := config.NormalizeNotifyRouteMode(notification.RouteMode)
+	if mode == config.NotifyRouteModeActiveOnly {
+		return s.sendActiveOnly(ctx, notification)
+	}
+	return s.sendHistory(ctx, notification)
+}
+
+// sendHistory posts regular Mattermost history notifications.
+// Params: context and payload.
+// Returns: send result (firing returns root post id as external ref).
+func (s *MattermostSender) sendHistory(ctx context.Context, notification domain.Notification) (SendResult, error) {
 	rootID := strings.TrimSpace(notification.ExternalRef)
 	if notification.State == domain.AlertStateResolved && rootID == "" {
 		return SendResult{}, errors.New("mattermost resolved requires external_ref")
@@ -508,35 +656,9 @@ func (s *MattermostSender) Send(ctx context.Context, notification domain.Notific
 		Message:   notification.Message,
 		RootID:    rootID,
 	}
-	body, err := json.Marshal(payload)
+	decoded, err := s.createPost(ctx, payload)
 	if err != nil {
-		return SendResult{}, fmt.Errorf("encode mattermost payload: %w", err)
-	}
-
-	endpoint := strings.TrimRight(strings.TrimSpace(s.cfg.BaseURL), "/") + "/api/v4/posts"
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return SendResult{}, fmt.Errorf("build mattermost request: %w", err)
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(s.cfg.BotToken))
-
-	response, err := s.client.Do(request)
-	if err != nil {
-		return SendResult{}, fmt.Errorf("mattermost send: %w", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return SendResult{}, unexpectedHTTPStatusError("mattermost", response)
-	}
-	var decoded struct {
-		ID string `json:"id"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
-		return SendResult{}, fmt.Errorf("decode mattermost response: %w", err)
-	}
-	if strings.TrimSpace(decoded.ID) == "" {
-		return SendResult{}, errors.New("mattermost response missing id")
+		return SendResult{}, err
 	}
 	if notification.State == domain.AlertStateFiring {
 		return SendResult{ExternalRef: decoded.ID}, nil
@@ -544,22 +666,195 @@ func (s *MattermostSender) Send(ctx context.Context, notification domain.Notific
 	return SendResult{}, nil
 }
 
-// unexpectedHTTPStatusError formats non-2xx HTTP response with optional body.
-// Params: sender prefix label and HTTP response pointer.
-// Returns: status-only or status+body error.
-func unexpectedHTTPStatusError(prefix string, response *http.Response) error {
-	if response == nil {
-		return fmt.Errorf("%s status=0", prefix)
+// sendActiveOnly keeps one active Mattermost post per route.
+// Params: context and payload.
+// Returns: send result with active post id for create/update.
+func (s *MattermostSender) sendActiveOnly(ctx context.Context, notification domain.Notification) (SendResult, error) {
+	activePostID := strings.TrimSpace(notification.ExternalRef)
+	switch notification.State {
+	case domain.AlertStateResolved:
+		if activePostID == "" {
+			return SendResult{}, errors.New("mattermost active resolved requires external_ref")
+		}
+		if err := s.deletePost(ctx, activePostID); err != nil {
+			return SendResult{}, err
+		}
+		return SendResult{}, nil
+	default:
+		if activePostID == "" {
+			channelID := strings.TrimSpace(s.cfg.ActiveChannelID)
+			if channelID == "" {
+				channelID = strings.TrimSpace(s.cfg.ChannelID)
+			}
+			decoded, err := s.createPost(ctx, struct {
+				ChannelID string `json:"channel_id"`
+				Message   string `json:"message"`
+			}{
+				ChannelID: channelID,
+				Message:   notification.Message,
+			})
+			if err != nil {
+				return SendResult{}, err
+			}
+			return SendResult{ExternalRef: decoded.ID}, nil
+		}
+		if err := s.updatePost(ctx, activePostID, notification.Message); err != nil {
+			return SendResult{}, err
+		}
+		return SendResult{ExternalRef: activePostID}, nil
 	}
-	rawBody, readErr := io.ReadAll(response.Body)
-	if readErr != nil {
-		return fmt.Errorf("%s status=%d (read body error: %w)", prefix, response.StatusCode, readErr)
+}
+
+// createPost creates one Mattermost post and returns decoded response.
+// Params: context and payload struct.
+// Returns: created post response body.
+func (s *MattermostSender) createPost(ctx context.Context, payload any) (struct {
+	ID string `json:"id"`
+}, error) {
+	var empty struct {
+		ID string `json:"id"`
 	}
-	trimmedBody := strings.TrimSpace(string(rawBody))
+	request, err := buildJSONRequest(ctx, http.MethodPost, s.postsEndpoint(""), payload, "mattermost")
+	if err != nil {
+		return empty, err
+	}
+	s.applyAuth(request)
+	responseBody, err := executeRequest(s.client, request, "mattermost", nil)
+	if err != nil {
+		return empty, err
+	}
+	var decoded struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(responseBody, &decoded); err != nil {
+		return empty, fmt.Errorf("decode mattermost response: %w", err)
+	}
+	if strings.TrimSpace(decoded.ID) == "" {
+		return empty, errors.New("mattermost response missing id")
+	}
+	return decoded, nil
+}
+
+// updatePost updates existing Mattermost post text.
+// Params: context, post id, and new message body.
+// Returns: transport or HTTP error.
+func (s *MattermostSender) updatePost(ctx context.Context, postID, message string) error {
+	payload := struct {
+		ID      string `json:"id"`
+		Message string `json:"message"`
+	}{
+		ID:      postID,
+		Message: message,
+	}
+	request, err := buildJSONRequest(ctx, http.MethodPut, s.postsEndpoint(postID), payload, "mattermost update")
+	if err != nil {
+		return err
+	}
+	s.applyAuth(request)
+	if _, err := executeRequest(s.client, request, "mattermost", nil); err != nil {
+		return err
+	}
+	return nil
+}
+
+// deletePost deletes one Mattermost post by id.
+// Params: context and post id.
+// Returns: transport or HTTP error.
+func (s *MattermostSender) deletePost(ctx context.Context, postID string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.postsEndpoint(postID), nil)
+	if err != nil {
+		return fmt.Errorf("build mattermost delete request: %w", err)
+	}
+	s.applyAuth(request)
+	if _, err := executeRequest(s.client, request, "mattermost", nil); err != nil {
+		return err
+	}
+	return nil
+}
+
+// postsEndpoint returns Mattermost posts endpoint with optional post id.
+// Params: optional post id.
+// Returns: API endpoint URL.
+func (s *MattermostSender) postsEndpoint(postID string) string {
+	base := strings.TrimRight(strings.TrimSpace(s.cfg.BaseURL), "/") + "/api/v4/posts"
+	if strings.TrimSpace(postID) == "" {
+		return base
+	}
+	return base + "/" + url.PathEscape(postID)
+}
+
+// applyAuth injects bot bearer token into Mattermost request.
+// Params: mutable HTTP request.
+// Returns: request mutated in place.
+func (s *MattermostSender) applyAuth(request *http.Request) {
+	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(s.cfg.BotToken))
+}
+
+// buildJSONRequest builds HTTP request with JSON-encoded payload when provided.
+// Params: context, method, endpoint, optional payload, and prefix for wrapped errors.
+// Returns: initialized request with `Content-Type: application/json` when payload is present.
+func buildJSONRequest(ctx context.Context, method, endpoint string, payload any, prefix string) (*http.Request, error) {
+	var bodyReader io.Reader
+	if payload != nil {
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("encode %s payload: %w", prefix, err)
+		}
+		bodyReader = bytes.NewReader(body)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, endpoint, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("build %s request: %w", prefix, err)
+	}
+	if payload != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	return request, nil
+}
+
+// executeRequest sends request and validates response status.
+// Params: HTTP client, request, error prefix, and optional accepted status set (nil => any 2xx).
+// Returns: full response body for successful status.
+func executeRequest(client *http.Client, request *http.Request, prefix string, successStatus map[int]struct{}) ([]byte, error) {
+	if client == nil {
+		return nil, fmt.Errorf("%s client is nil", prefix)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("%s send: %w", prefix, err)
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, fmt.Errorf("%s read response: %w", prefix, err)
+	}
+	if !isHTTPStatusAccepted(response.StatusCode, successStatus) {
+		return nil, formatHTTPStatusError(prefix, response.StatusCode, body)
+	}
+	return body, nil
+}
+
+// isHTTPStatusAccepted checks status against optional explicit allow list.
+// Params: response status code and optional allowed statuses.
+// Returns: true when status is accepted.
+func isHTTPStatusAccepted(statusCode int, successStatus map[int]struct{}) bool {
+	if len(successStatus) == 0 {
+		return statusCode >= 200 && statusCode < 300
+	}
+	_, ok := successStatus[statusCode]
+	return ok
+}
+
+// formatHTTPStatusError formats status/body failure details.
+// Params: error prefix, status code, and response body bytes.
+// Returns: status-only or status+trimmed-body error.
+func formatHTTPStatusError(prefix string, statusCode int, body []byte) error {
+	trimmedBody := strings.TrimSpace(string(body))
 	if trimmedBody == "" {
-		return fmt.Errorf("%s status=%d", prefix, response.StatusCode)
+		return fmt.Errorf("%s status=%d", prefix, statusCode)
 	}
-	return fmt.Errorf("%s status=%d body=%s", prefix, response.StatusCode, trimmedBody)
+	return fmt.Errorf("%s status=%d body=%s", prefix, statusCode, trimmedBody)
 }
 
 // TrackerSender sends tracker lifecycle actions (create/resolve) over HTTP.
@@ -700,23 +995,9 @@ func (s *TrackerSender) executeAction(ctx context.Context, action trackerActionR
 	}
 	applyTrackerAuth(request, s.cfg.Auth)
 
-	response, err := s.client.Do(request)
+	responseBody, err := executeRequest(s.client, request, "tracker "+s.channel, action.successStatus)
 	if err != nil {
-		return SendResult{}, fmt.Errorf("tracker %s send: %w", s.channel, err)
-	}
-	defer response.Body.Close()
-
-	responseBody, err := io.ReadAll(response.Body)
-	if err != nil {
-		return SendResult{}, fmt.Errorf("tracker %s read response: %w", s.channel, err)
-	}
-
-	if _, ok := action.successStatus[response.StatusCode]; !ok {
-		trimmedBody := strings.TrimSpace(string(responseBody))
-		if trimmedBody == "" {
-			return SendResult{}, fmt.Errorf("tracker %s status=%d", s.channel, response.StatusCode)
-		}
-		return SendResult{}, fmt.Errorf("tracker %s status=%d body=%s", s.channel, response.StatusCode, trimmedBody)
+		return SendResult{}, err
 	}
 
 	if strings.TrimSpace(action.responseRefKey) == "" {

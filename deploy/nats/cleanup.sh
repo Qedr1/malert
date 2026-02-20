@@ -16,6 +16,7 @@ fi
 : "${INGEST_CONSUMER:=alerting-ingest}"
 : "${NOTIFY_STREAM:=ALERTING_NOTIFY}"
 : "${NOTIFY_CONSUMER:=alerting-notify}"
+: "${NOTIFY_DLQ_STREAM:=ALERTING_NOTIFY_DLQ}"
 : "${TICK_BUCKET:=tick}"
 : "${DATA_BUCKET:=data}"
 : "${RESOLVE_CONSUMER:=alerting-resolve}"
@@ -45,6 +46,10 @@ if exists_consumer "$NOTIFY_STREAM" "$NOTIFY_CONSUMER"; then
 fi
 if exists_stream "$NOTIFY_STREAM"; then
   "${nats_cmd[@]}" stream rm "$NOTIFY_STREAM" --force >/dev/null
+fi
+echo "[notify_queue] remove DLQ stream (if present): $NOTIFY_DLQ_STREAM"
+if exists_stream "$NOTIFY_DLQ_STREAM"; then
+  "${nats_cmd[@]}" stream rm "$NOTIFY_DLQ_STREAM" --force >/dev/null
 fi
 
 echo "[state] remove consumer/kv (if present): $RESOLVE_CONSUMER, $TICK_BUCKET, $DATA_BUCKET"

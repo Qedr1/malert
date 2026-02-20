@@ -94,6 +94,58 @@ func TestEngineMissingHeartbeatFireAndResolve(t *testing.T) {
 	}
 }
 
+func TestEngineCountWindowFireAndResolveBySilence(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	rule := config.RuleConfig{
+		Name:      "cw",
+		AlertType: "count_window",
+		Match: config.RuleMatch{
+			Type: []string{"event"},
+			Var:  []string{"errors"},
+			Tags: map[string]config.StringList{"dc": {"dc1"}},
+		},
+		Pending: config.RulePending{Enabled: false},
+		Raise: config.RuleRaise{
+			N:       3,
+			TaggSec: 5,
+		},
+		Resolve: config.RuleResolve{SilenceSec: 4},
+	}
+	e := New()
+
+	numberValue := 1.0
+	event := domain.Event{
+		Type:   domain.EventTypeEvent,
+		AggCnt: 2,
+		Var:    "errors",
+		Tags:   map[string]string{"dc": "dc1"},
+		Value:  domain.TypedValue{Type: "n", N: &numberValue},
+	}
+
+	decision := e.ProcessEvent(rule, event, "rule/cw/errors/hash", now)
+	if !decision.Matched || decision.StateChanged {
+		t.Fatalf("expected matched non-transition decision, got %+v", decision)
+	}
+
+	event.AggCnt = 1
+	decision = e.ProcessEvent(rule, event, "rule/cw/errors/hash", now.Add(time.Second))
+	if !decision.StateChanged || decision.State != domain.AlertStateFiring {
+		t.Fatalf("expected firing transition, got %+v", decision)
+	}
+
+	ticks := e.TickRule(rule, now.Add(2*time.Second))
+	if len(ticks) != 0 {
+		t.Fatalf("expected no resolve before silence timeout, got %+v", ticks)
+	}
+
+	ticks = e.TickRule(rule, now.Add(6*time.Second))
+	if len(ticks) != 1 || ticks[0].State != domain.AlertStateResolved {
+		t.Fatalf("expected resolved by silence timeout, got %+v", ticks)
+	}
+}
+
 func TestTickRuleWithFiringReturnsActiveFiringIDs(t *testing.T) {
 	t.Parallel()
 

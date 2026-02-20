@@ -39,6 +39,8 @@ type AlertCard struct {
 // Returns: one notification request for notifier layer.
 type Notification struct {
 	Channel          string            `json:"channel"`
+	RouteKey         string            `json:"route_key,omitempty"`
+	RouteMode        string            `json:"route_mode,omitempty"`
 	AlertID          string            `json:"alert_id"`
 	ShortID          string            `json:"short_id,omitempty"`
 	RuleName         string            `json:"rule_name"`

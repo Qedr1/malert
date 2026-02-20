@@ -16,31 +16,33 @@ import (
 )
 
 const (
-	defaultHTTPListen          = ":8080"
-	defaultHealthPath          = "/healthz"
-	defaultReadyPath           = "/readyz"
-	defaultIngestPath          = "/ingest"
-	defaultNATSSubject         = "alerting.events"
-	defaultNATSIngestStream    = "ALERTING_EVENTS"
-	defaultNATSIngestConsumer  = "alerting-ingest"
-	defaultNATSIngestGroup     = "alerting-workers"
-	defaultNATSAckWaitSec      = 30
-	defaultNATSNackDelayMS     = 1000
-	defaultNATSMaxDeliver      = -1
-	defaultNATSMaxAckPending   = 2048
-	defaultNATSURL             = "nats://127.0.0.1:4222"
-	defaultNATSTickBucket      = "tick"
-	defaultNATSDataBucket      = "data"
-	defaultNotifyQueueSubject  = "alerting.notify.jobs"
-	defaultNotifyQueueStream   = "ALERTING_NOTIFY"
-	defaultNotifyQueueConsumer = "alerting-notify"
-	defaultNotifyQueueGroup    = "alerting-notify-workers"
-	defaultDeleteConsumer      = "alerting-resolve"
-	defaultDeleteDeliver       = "alerting-resolve"
-	defaultReloadSeconds       = 5
-	defaultResolveScanSeconds  = 1
-	defaultNotifyRepeatSeconds = 300
-	defaultPendingDelaySeconds = 300
+	defaultHTTPListen            = ":8080"
+	defaultHealthPath            = "/healthz"
+	defaultReadyPath             = "/readyz"
+	defaultIngestPath            = "/ingest"
+	defaultNATSSubject           = "alerting.events"
+	defaultNATSIngestStream      = "ALERTING_EVENTS"
+	defaultNATSIngestConsumer    = "alerting-ingest"
+	defaultNATSIngestGroup       = "alerting-workers"
+	defaultNATSAckWaitSec        = 30
+	defaultNATSNackDelayMS       = 1000
+	defaultNATSMaxDeliver        = -1
+	defaultNATSMaxAckPending     = 2048
+	defaultNATSURL               = "nats://127.0.0.1:4222"
+	defaultNATSTickBucket        = "tick"
+	defaultNATSDataBucket        = "data"
+	defaultNotifyQueueSubject    = "alerting.notify.jobs"
+	defaultNotifyQueueStream     = "ALERTING_NOTIFY"
+	defaultNotifyQueueDLQSubject = "alerting.notify.jobs.dlq"
+	defaultNotifyQueueDLQStream  = "ALERTING_NOTIFY_DLQ"
+	defaultNotifyQueueConsumer   = "alerting-notify"
+	defaultNotifyQueueGroup      = "alerting-notify-workers"
+	defaultDeleteConsumer        = "alerting-resolve"
+	defaultDeleteDeliver         = "alerting-resolve"
+	defaultReloadSeconds         = 5
+	defaultResolveScanSeconds    = 1
+	defaultNotifyRepeatSeconds   = 300
+	defaultPendingDelaySeconds   = 300
 
 	// NotifyChannelTelegram identifies Telegram transport.
 	NotifyChannelTelegram = "telegram"
@@ -52,6 +54,11 @@ const (
 	NotifyChannelJira = "jira"
 	// NotifyChannelYouTrack identifies YouTrack tracker transport.
 	NotifyChannelYouTrack = "youtrack"
+
+	// NotifyRouteModeHistory keeps normal message history flow.
+	NotifyRouteModeHistory = "history"
+	// NotifyRouteModeActiveOnly keeps one active message and removes it on resolve.
+	NotifyRouteModeActiveOnly = "active_only"
 )
 
 var (
@@ -62,12 +69,42 @@ var (
 		NotifyChannelJira,
 		NotifyChannelYouTrack,
 	}
-	notifyChannelSet = map[string]struct{}{
-		NotifyChannelTelegram:   {},
-		NotifyChannelHTTP:       {},
-		NotifyChannelMattermost: {},
-		NotifyChannelJira:       {},
-		NotifyChannelYouTrack:   {},
+	notifyChannelRegistry = map[string]notifyChannelDescriptor{
+		NotifyChannelTelegram: {
+			enabled: func(cfg NotifyConfig) bool { return cfg.Telegram.Enabled },
+			retry:   func(cfg NotifyConfig) NotifyRetry { return cfg.Telegram.Retry },
+			templates: func(cfg NotifyConfig) []NamedTemplateConfig {
+				return cfg.Telegram.NameTemplate
+			},
+		},
+		NotifyChannelHTTP: {
+			enabled: func(cfg NotifyConfig) bool { return cfg.HTTP.Enabled },
+			retry:   func(cfg NotifyConfig) NotifyRetry { return cfg.HTTP.Retry },
+			templates: func(cfg NotifyConfig) []NamedTemplateConfig {
+				return cfg.HTTP.NameTemplate
+			},
+		},
+		NotifyChannelMattermost: {
+			enabled: func(cfg NotifyConfig) bool { return cfg.Mattermost.Enabled },
+			retry:   func(cfg NotifyConfig) NotifyRetry { return cfg.Mattermost.Retry },
+			templates: func(cfg NotifyConfig) []NamedTemplateConfig {
+				return cfg.Mattermost.NameTemplate
+			},
+		},
+		NotifyChannelJira: {
+			enabled: func(cfg NotifyConfig) bool { return cfg.Jira.Enabled },
+			retry:   func(cfg NotifyConfig) NotifyRetry { return cfg.Jira.Retry },
+			templates: func(cfg NotifyConfig) []NamedTemplateConfig {
+				return cfg.Jira.NameTemplate
+			},
+		},
+		NotifyChannelYouTrack: {
+			enabled: func(cfg NotifyConfig) bool { return cfg.YouTrack.Enabled },
+			retry:   func(cfg NotifyConfig) NotifyRetry { return cfg.YouTrack.Retry },
+			templates: func(cfg NotifyConfig) []NamedTemplateConfig {
+				return cfg.YouTrack.NameTemplate
+			},
+		},
 	}
 	supportedValuePredicateOps = map[string]map[string]struct{}{
 		"n": {
@@ -94,6 +131,15 @@ var (
 	legacyRuleArrayPattern  = regexp.MustCompile(`(?m)^\s*\[\[\s*rule\s*\]\]`)
 	unsupportedStatePattern = regexp.MustCompile(`(?m)^\s*\[\[?\s*state(?:\.[^\]\s]+)*\s*\]\]?`)
 )
+
+// notifyChannelDescriptor stores generic accessors for one notify transport.
+// Params: config readers for enabled/retry/templates fields.
+// Returns: channel metadata used by generic helpers.
+type notifyChannelDescriptor struct {
+	enabled   func(NotifyConfig) bool
+	retry     func(NotifyConfig) NotifyRetry
+	templates func(NotifyConfig) []NamedTemplateConfig
+}
 
 // Config holds service runtime settings and alert rules.
 // Params: TOML sections from file or merged directory snapshot.
@@ -236,16 +282,26 @@ type NotifyConfig struct {
 // Params: NATS stream/consumer options for notification jobs.
 // Returns: async notify pipeline controls.
 type NotifyQueue struct {
-	Enabled       bool   `toml:"enabled"`
-	URL           string `toml:"url"`
-	Subject       string `toml:"subject"`
-	Stream        string `toml:"stream"`
-	ConsumerName  string `toml:"consumer_name"`
-	DeliverGroup  string `toml:"deliver_group"`
-	AckWaitSec    int    `toml:"ack_wait_sec"`
-	NackDelayMS   int    `toml:"nack_delay_ms"`
-	MaxDeliver    int    `toml:"max_deliver"`
-	MaxAckPending int    `toml:"max_ack_pending"`
+	Enabled       bool           `toml:"enabled"`
+	URL           string         `toml:"url"`
+	Subject       string         `toml:"subject"`
+	Stream        string         `toml:"stream"`
+	ConsumerName  string         `toml:"consumer_name"`
+	DeliverGroup  string         `toml:"deliver_group"`
+	AckWaitSec    int            `toml:"ack_wait_sec"`
+	NackDelayMS   int            `toml:"nack_delay_ms"`
+	MaxDeliver    int            `toml:"max_deliver"`
+	MaxAckPending int            `toml:"max_ack_pending"`
+	DLQ           NotifyQueueDLQ `toml:"dlq"`
+}
+
+// NotifyQueueDLQ defines dead-letter queue settings for dropped notify jobs.
+// Params: enable flag and destination subject/stream.
+// Returns: DLQ controls for notify queue worker.
+type NotifyQueueDLQ struct {
+	Enabled bool   `toml:"enabled"`
+	Subject string `toml:"subject"`
+	Stream  string `toml:"stream"`
 }
 
 // NamedTemplateConfig describes one reusable message template within one channel section.
@@ -275,6 +331,7 @@ type TelegramNotifier struct {
 	Enabled      bool                  `toml:"enabled"`
 	BotToken     string                `toml:"bot_token"`
 	ChatID       string                `toml:"chat_id"`
+	ActiveChatID string                `toml:"active_chat_id"`
 	APIBase      string                `toml:"api_base"`
 	Retry        NotifyRetry           `toml:"retry"`
 	NameTemplate []NamedTemplateConfig `toml:"name-template"`
@@ -297,13 +354,14 @@ type HTTPNotifier struct {
 // Params: enabled flag, API base URL, bot token, channel id, and retry policy.
 // Returns: Mattermost sender configuration.
 type MattermostConfig struct {
-	Enabled      bool                  `toml:"enabled"`
-	BaseURL      string                `toml:"base_url"`
-	BotToken     string                `toml:"bot_token"`
-	ChannelID    string                `toml:"channel_id"`
-	TimeoutSec   int                   `toml:"timeout_sec"`
-	Retry        NotifyRetry           `toml:"retry"`
-	NameTemplate []NamedTemplateConfig `toml:"name-template"`
+	Enabled         bool                  `toml:"enabled"`
+	BaseURL         string                `toml:"base_url"`
+	BotToken        string                `toml:"bot_token"`
+	ChannelID       string                `toml:"channel_id"`
+	ActiveChannelID string                `toml:"active_channel_id"`
+	TimeoutSec      int                   `toml:"timeout_sec"`
+	Retry           NotifyRetry           `toml:"retry"`
+	NameTemplate    []NamedTemplateConfig `toml:"name-template"`
 }
 
 // TrackerNotifier defines tracker transport settings (Jira/YouTrack) over HTTP.
@@ -476,8 +534,10 @@ type RuleNotify struct {
 // Params: transport channel and notify template name.
 // Returns: one outbound routing rule for alert notifications.
 type RuleNotifyRoute struct {
+	Name     string `toml:"name"`
 	Channel  string `toml:"channel"`
 	Template string `toml:"template"`
+	Mode     string `toml:"mode"`
 }
 
 // RuleOutOfOrder defines safeguards for delayed/future events.
@@ -565,12 +625,20 @@ type notifyMergeHints struct {
 	Repeat           *bool             `toml:"repeat"`
 	RepeatPerChannel *bool             `toml:"repeat_per_channel"`
 	OnPending        *bool             `toml:"on_pending"`
-	Queue            channelMergeHints `toml:"queue"`
+	Queue            queueMergeHints   `toml:"queue"`
 	Telegram         channelMergeHints `toml:"telegram"`
 	HTTP             channelMergeHints `toml:"http"`
 	Mattermost       channelMergeHints `toml:"mattermost"`
 	Jira             channelMergeHints `toml:"jira"`
 	YouTrack         channelMergeHints `toml:"youtrack"`
+}
+
+// queueMergeHints tracks explicit bool fields in notify.queue section.
+// Params: sparse queue fields decoded from one TOML fragment.
+// Returns: bool-presence markers for queue merge logic.
+type queueMergeHints struct {
+	Enabled *bool             `toml:"enabled"`
+	DLQ     channelMergeHints `toml:"dlq"`
 }
 
 // channelMergeHints tracks explicit enabled flags in channel sections.
@@ -588,6 +656,7 @@ func (h notifyMergeHints) hasExplicitBool() bool {
 		h.RepeatPerChannel != nil ||
 		h.OnPending != nil ||
 		h.Queue.Enabled != nil ||
+		h.Queue.DLQ.Enabled != nil ||
 		h.Telegram.Enabled != nil ||
 		h.HTTP.Enabled != nil ||
 		h.Mattermost.Enabled != nil ||
@@ -779,7 +848,7 @@ func mergeNotifyConfig(dst *NotifyConfig, src NotifyConfig, hints notifyMergeHin
 // mergeNotifyQueue overlays async queue config preserving other notify fields.
 // Params: destination queue config and source fragment.
 // Returns: merged queue config side-effect in dst.
-func mergeNotifyQueue(dst *NotifyQueue, src NotifyQueue, hints channelMergeHints) {
+func mergeNotifyQueue(dst *NotifyQueue, src NotifyQueue, hints queueMergeHints) {
 	applyBoolMerge(&dst.Enabled, src.Enabled, hints.Enabled)
 	if strings.TrimSpace(src.URL) != "" {
 		dst.URL = src.URL
@@ -808,6 +877,13 @@ func mergeNotifyQueue(dst *NotifyQueue, src NotifyQueue, hints channelMergeHints
 	if src.MaxAckPending != 0 {
 		dst.MaxAckPending = src.MaxAckPending
 	}
+	applyBoolMerge(&dst.DLQ.Enabled, src.DLQ.Enabled, hints.DLQ.Enabled)
+	if strings.TrimSpace(src.DLQ.Subject) != "" {
+		dst.DLQ.Subject = src.DLQ.Subject
+	}
+	if strings.TrimSpace(src.DLQ.Stream) != "" {
+		dst.DLQ.Stream = src.DLQ.Stream
+	}
 }
 
 // mergeTelegramNotifier overlays telegram transport config preserving other notify fields.
@@ -820,6 +896,9 @@ func mergeTelegramNotifier(dst *TelegramNotifier, src TelegramNotifier, hints ch
 	}
 	if strings.TrimSpace(src.ChatID) != "" {
 		dst.ChatID = src.ChatID
+	}
+	if strings.TrimSpace(src.ActiveChatID) != "" {
+		dst.ActiveChatID = src.ActiveChatID
 	}
 	if strings.TrimSpace(src.APIBase) != "" {
 		dst.APIBase = src.APIBase
@@ -875,6 +954,9 @@ func mergeMattermostNotifier(dst *MattermostConfig, src MattermostConfig, hints 
 	}
 	if strings.TrimSpace(src.ChannelID) != "" {
 		dst.ChannelID = src.ChannelID
+	}
+	if strings.TrimSpace(src.ActiveChannelID) != "" {
+		dst.ActiveChannelID = src.ActiveChannelID
 	}
 	if src.TimeoutSec != 0 {
 		dst.TimeoutSec = src.TimeoutSec
@@ -969,10 +1051,19 @@ func hasNotifyConfig(cfg NotifyConfig) bool {
 		cfg.Queue.AckWaitSec != 0 ||
 		cfg.Queue.NackDelayMS != 0 ||
 		cfg.Queue.MaxDeliver != 0 ||
-		cfg.Queue.MaxAckPending != 0 {
+		cfg.Queue.MaxAckPending != 0 ||
+		cfg.Queue.DLQ.Enabled ||
+		strings.TrimSpace(cfg.Queue.DLQ.Subject) != "" ||
+		strings.TrimSpace(cfg.Queue.DLQ.Stream) != "" {
 		return true
 	}
-	if cfg.Telegram.Enabled || strings.TrimSpace(cfg.Telegram.BotToken) != "" || strings.TrimSpace(cfg.Telegram.ChatID) != "" || strings.TrimSpace(cfg.Telegram.APIBase) != "" || cfg.Telegram.Retry != (NotifyRetry{}) || len(cfg.Telegram.NameTemplate) > 0 {
+	if cfg.Telegram.Enabled ||
+		strings.TrimSpace(cfg.Telegram.BotToken) != "" ||
+		strings.TrimSpace(cfg.Telegram.ChatID) != "" ||
+		strings.TrimSpace(cfg.Telegram.ActiveChatID) != "" ||
+		strings.TrimSpace(cfg.Telegram.APIBase) != "" ||
+		cfg.Telegram.Retry != (NotifyRetry{}) ||
+		len(cfg.Telegram.NameTemplate) > 0 {
 		return true
 	}
 	if cfg.HTTP.Enabled || strings.TrimSpace(cfg.HTTP.URL) != "" || strings.TrimSpace(cfg.HTTP.Method) != "" || cfg.HTTP.TimeoutSec != 0 || len(cfg.HTTP.Headers) > 0 || cfg.HTTP.Retry != (NotifyRetry{}) || len(cfg.HTTP.NameTemplate) > 0 {
@@ -982,6 +1073,7 @@ func hasNotifyConfig(cfg NotifyConfig) bool {
 		strings.TrimSpace(cfg.Mattermost.BaseURL) != "" ||
 		strings.TrimSpace(cfg.Mattermost.BotToken) != "" ||
 		strings.TrimSpace(cfg.Mattermost.ChannelID) != "" ||
+		strings.TrimSpace(cfg.Mattermost.ActiveChannelID) != "" ||
 		cfg.Mattermost.TimeoutSec != 0 ||
 		cfg.Mattermost.Retry != (NotifyRetry{}) ||
 		len(cfg.Mattermost.NameTemplate) > 0 {
@@ -1130,6 +1222,12 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Notify.Queue.MaxAckPending <= 0 {
 		cfg.Notify.Queue.MaxAckPending = defaultNATSMaxAckPending
+	}
+	if cfg.Notify.Queue.DLQ.Subject == "" {
+		cfg.Notify.Queue.DLQ.Subject = defaultNotifyQueueDLQSubject
+	}
+	if cfg.Notify.Queue.DLQ.Stream == "" {
+		cfg.Notify.Queue.DLQ.Stream = defaultNotifyQueueDLQStream
 	}
 	if cfg.Notify.Telegram.APIBase == "" {
 		cfg.Notify.Telegram.APIBase = "https://api.telegram.org"
@@ -1317,6 +1415,20 @@ func validateConfig(cfg Config) error {
 		}
 		if cfg.Notify.Queue.MaxAckPending <= 0 {
 			return errors.New("notify.queue.max_ack_pending must be >0 when notify.queue.enabled=true")
+		}
+	}
+	if cfg.Notify.Queue.DLQ.Enabled {
+		if !cfg.Notify.Queue.Enabled {
+			return errors.New("notify.queue.dlq.enabled requires notify.queue.enabled=true")
+		}
+		if strings.TrimSpace(cfg.Notify.Queue.DLQ.Subject) == "" {
+			return errors.New("notify.queue.dlq.subject is required when notify.queue.dlq.enabled=true")
+		}
+		if strings.TrimSpace(cfg.Notify.Queue.DLQ.Stream) == "" {
+			return errors.New("notify.queue.dlq.stream is required when notify.queue.dlq.enabled=true")
+		}
+		if strings.TrimSpace(cfg.Notify.Queue.DLQ.Subject) == strings.TrimSpace(cfg.Notify.Queue.Subject) {
+			return errors.New("notify.queue.dlq.subject must differ from notify.queue.subject")
 		}
 	}
 	if cfg.Notify.Mattermost.Enabled && strings.TrimSpace(cfg.Notify.Mattermost.BaseURL) == "" {
@@ -1623,7 +1735,7 @@ func collectChannelTemplates(index map[string]map[string]NamedTemplateConfig, ch
 // Params: global notify config, one rule, and template lookup.
 // Returns: validation error on unknown template/channel mismatch/disabled channel.
 func validateRuleNotifyRoutes(notifyCfg NotifyConfig, rule RuleConfig, templates map[string]map[string]NamedTemplateConfig) error {
-	usedChannels := make(map[string]struct{}, len(rule.Notify.Route))
+	usedRouteKeys := make(map[string]struct{}, len(rule.Notify.Route))
 	for index, route := range rule.Notify.Route {
 		channel := NormalizeNotifyChannel(route.Channel)
 		if !IsSupportedNotifyChannel(channel) {
@@ -1632,10 +1744,14 @@ func validateRuleNotifyRoutes(notifyCfg NotifyConfig, rule RuleConfig, templates
 		if !NotifyChannelEnabled(notifyCfg, channel) {
 			return fmt.Errorf("notify.route[%d].channel %q is disabled in [notify.%s]", index, route.Channel, channel)
 		}
-		if _, exists := usedChannels[channel]; exists {
-			return fmt.Errorf("notify.route has duplicate channel %q", channel)
+		routeKey := strings.ToLower(strings.TrimSpace(route.Name))
+		if routeKey == "" {
+			routeKey = channel
 		}
-		usedChannels[channel] = struct{}{}
+		if _, exists := usedRouteKeys[routeKey]; exists {
+			return fmt.Errorf("notify.route has duplicate key %q", routeKey)
+		}
+		usedRouteKeys[routeKey] = struct{}{}
 
 		templateName := strings.TrimSpace(route.Template)
 		if templateName == "" {
@@ -1647,6 +1763,26 @@ func validateRuleNotifyRoutes(notifyCfg NotifyConfig, rule RuleConfig, templates
 		}
 		if _, exists := templatesByName[strings.ToLower(templateName)]; !exists {
 			return fmt.Errorf("notify.route[%d].template %q is not defined in [[notify.%s.name-template]]", index, route.Template, channel)
+		}
+
+		mode := NormalizeNotifyRouteMode(route.Mode)
+		if !IsSupportedNotifyRouteMode(mode) {
+			return fmt.Errorf("notify.route[%d].mode has unsupported value %q", index, route.Mode)
+		}
+		if mode != NotifyRouteModeActiveOnly {
+			continue
+		}
+		switch channel {
+		case NotifyChannelTelegram:
+			if strings.TrimSpace(notifyCfg.Telegram.ActiveChatID) == "" {
+				return fmt.Errorf("notify.route[%d] active_only requires notify.telegram.active_chat_id", index)
+			}
+		case NotifyChannelMattermost:
+			if strings.TrimSpace(notifyCfg.Mattermost.ActiveChannelID) == "" {
+				return fmt.Errorf("notify.route[%d] active_only requires notify.mattermost.active_channel_id", index)
+			}
+		default:
+			return fmt.Errorf("notify.route[%d] active_only is supported only for telegram and mattermost", index)
 		}
 	}
 	return nil
@@ -1765,6 +1901,29 @@ func NormalizeNotifyChannel(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
+// NormalizeNotifyRouteMode canonicalizes notify route mode and applies default.
+// Params: raw mode value from config.
+// Returns: normalized route mode (`history` by default).
+func NormalizeNotifyRouteMode(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return NotifyRouteModeHistory
+	}
+	return normalized
+}
+
+// IsSupportedNotifyRouteMode reports whether route mode value is supported.
+// Params: normalized route mode.
+// Returns: true for known modes.
+func IsSupportedNotifyRouteMode(mode string) bool {
+	switch NormalizeNotifyRouteMode(mode) {
+	case NotifyRouteModeHistory, NotifyRouteModeActiveOnly:
+		return true
+	default:
+		return false
+	}
+}
+
 // NotifyChannelNames returns deterministic list of supported channel keys.
 // Params: none.
 // Returns: ordered channel key list.
@@ -1778,7 +1937,7 @@ func NotifyChannelNames() []string {
 // Params: normalized channel key.
 // Returns: true when channel is one of known transports.
 func IsSupportedNotifyChannel(channel string) bool {
-	_, exists := notifyChannelSet[NormalizeNotifyChannel(channel)]
+	_, exists := notifyChannelRegistry[NormalizeNotifyChannel(channel)]
 	return exists
 }
 
@@ -1786,60 +1945,41 @@ func IsSupportedNotifyChannel(channel string) bool {
 // Params: global notify config and normalized channel key.
 // Returns: true when corresponding transport section is enabled.
 func NotifyChannelEnabled(cfg NotifyConfig, channel string) bool {
-	switch NormalizeNotifyChannel(channel) {
-	case NotifyChannelTelegram:
-		return cfg.Telegram.Enabled
-	case NotifyChannelHTTP:
-		return cfg.HTTP.Enabled
-	case NotifyChannelMattermost:
-		return cfg.Mattermost.Enabled
-	case NotifyChannelJira:
-		return cfg.Jira.Enabled
-	case NotifyChannelYouTrack:
-		return cfg.YouTrack.Enabled
-	default:
+	descriptor, ok := notifyChannelDescriptorByName(channel)
+	if !ok || descriptor.enabled == nil {
 		return false
 	}
+	return descriptor.enabled(cfg)
 }
 
 // NotifyChannelRetry returns retry policy for one channel.
 // Params: global notify config and channel key.
 // Returns: retry policy for channel transport.
 func NotifyChannelRetry(cfg NotifyConfig, channel string) NotifyRetry {
-	switch NormalizeNotifyChannel(channel) {
-	case NotifyChannelTelegram:
-		return cfg.Telegram.Retry
-	case NotifyChannelHTTP:
-		return cfg.HTTP.Retry
-	case NotifyChannelMattermost:
-		return cfg.Mattermost.Retry
-	case NotifyChannelJira:
-		return cfg.Jira.Retry
-	case NotifyChannelYouTrack:
-		return cfg.YouTrack.Retry
-	default:
+	descriptor, ok := notifyChannelDescriptorByName(channel)
+	if !ok || descriptor.retry == nil {
 		return NotifyRetry{}
 	}
+	return descriptor.retry(cfg)
 }
 
 // NotifyChannelTemplates returns template catalog for one channel.
 // Params: global notify config and channel key.
 // Returns: channel template list copy.
 func NotifyChannelTemplates(cfg NotifyConfig, channel string) []NamedTemplateConfig {
-	switch NormalizeNotifyChannel(channel) {
-	case NotifyChannelTelegram:
-		return append([]NamedTemplateConfig(nil), cfg.Telegram.NameTemplate...)
-	case NotifyChannelHTTP:
-		return append([]NamedTemplateConfig(nil), cfg.HTTP.NameTemplate...)
-	case NotifyChannelMattermost:
-		return append([]NamedTemplateConfig(nil), cfg.Mattermost.NameTemplate...)
-	case NotifyChannelJira:
-		return append([]NamedTemplateConfig(nil), cfg.Jira.NameTemplate...)
-	case NotifyChannelYouTrack:
-		return append([]NamedTemplateConfig(nil), cfg.YouTrack.NameTemplate...)
-	default:
+	descriptor, ok := notifyChannelDescriptorByName(channel)
+	if !ok || descriptor.templates == nil {
 		return nil
 	}
+	return append([]NamedTemplateConfig(nil), descriptor.templates(cfg)...)
+}
+
+// notifyChannelDescriptorByName returns channel metadata descriptor by key.
+// Params: raw or normalized channel key.
+// Returns: descriptor and existence flag.
+func notifyChannelDescriptorByName(channel string) (notifyChannelDescriptor, bool) {
+	descriptor, exists := notifyChannelRegistry[NormalizeNotifyChannel(channel)]
+	return descriptor, exists
 }
 
 // validateMessageTemplate parses one text template and checks it is non-empty.
