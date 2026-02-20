@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,166 +65,125 @@ func (l *trackerRequestLog) resolvePath() string {
 }
 
 func TestJiraTrackerCreateAndResolveE2E(t *testing.T) {
-	port, err := freePort()
-	if err != nil {
-		t.Fatalf("free port: %v", err)
-	}
-	natsURL, stopNATS := startLocalNATSServer(t)
-	defer stopNATS()
+	for _, metric := range allE2EMetricCases() {
+		metric := metric
+		t.Run(metric.Name, func(t *testing.T) {
+			port, err := freePort()
+			if err != nil {
+				t.Fatalf("free port: %v", err)
+			}
+			natsURL, stopNATS := startLocalNATSServer(t)
+			defer stopNATS()
 
-	logs := &trackerRequestLog{}
-	tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		body, _ := io.ReadAll(r.Body)
-		_ = r.Body.Close()
-		logs.add(r.URL.Path, string(body))
+			logs := &trackerRequestLog{}
+			tracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+				body, _ := io.ReadAll(r.Body)
+				_ = r.Body.Close()
+				logs.add(r.URL.Path, string(body))
 
-		switch r.URL.Path {
-		case "/rest/api/3/issue":
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusCreated)
-			_, _ = w.Write([]byte(`{"key":"OPS-777"}`))
-		case "/rest/api/3/issue/OPS-777/transitions":
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer tracker.Close()
+				switch r.URL.Path {
+				case "/rest/api/3/issue":
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(`{"key":"OPS-777"}`))
+				case "/rest/api/3/issue/OPS-777/transitions":
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer tracker.Close()
 
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.toml")
-	cfg := fmt.Sprintf(`
-[service]
-name = "alerting"
-reload_enabled = false
-resolve_scan_interval_sec = 1
+			ruleName := "jira_tracker_" + metric.Name
+			ruleOptions := defaultE2ERuleOptions(metric)
+			switch metric.AlertType {
+			case "count_total", "count_window":
+				ruleOptions.ResolveSilenceSec = 1
+			default:
+				ruleOptions.MissingSec = 2
+			}
 
-[log.console]
-enabled = true
-level = "error"
-format = "line"
-
-[ingest.http]
-enabled = true
-listen = "127.0.0.1:%d"
-health_path = "/healthz"
-ready_path = "/readyz"
-ingest_path = "/ingest"
-max_body_bytes = 1048576
-
-[ingest.nats]
-enabled = false
-url = ["%s"]
-
-[notify]
-repeat = false
-repeat_every_sec = 300
-repeat_on = ["firing"]
-repeat_per_channel = true
-on_pending = false
-
+			tmpDir := t.TempDir()
+			configPath := filepath.Join(tmpDir, "config.toml")
+			cfg := e2eStandardConfigPrefix(port, natsURL) + fmt.Sprintf(`
 [notify.telegram]
-enabled = false
+	enabled = false
 
 [notify.jira]
-enabled = true
-base_url = "%s"
-timeout_sec = 2
+	enabled = true
+	base_url = "%s"
+	timeout_sec = 2
 
 [notify.jira.auth]
-type = "none"
+	type = "none"
 
 [notify.jira.retry]
-enabled = false
+	enabled = false
 
 [notify.jira.create]
-method = "POST"
-path = "/rest/api/3/issue"
-headers = { Content-Type = "application/json" }
-body_template = "{\"summary\": {{ json .Message }}, \"alert_id\": {{ json .AlertID }}}"
-success_status = [201]
-ref_json_path = "key"
+	method = "POST"
+	path = "/rest/api/3/issue"
+	headers = { Content-Type = "application/json" }
+	body_template = "{\"summary\": {{ json .Message }}, \"alert_id\": {{ json .AlertID }}}"
+	success_status = [201]
+	ref_json_path = "key"
 
 [notify.jira.resolve]
-method = "POST"
-path = "/rest/api/3/issue/{{ .ExternalRef }}/transitions"
-headers = { Content-Type = "application/json" }
-body_template = "{\"transition\":{\"id\":\"31\"}}"
-success_status = [204]
+	method = "POST"
+	path = "/rest/api/3/issue/{{ .ExternalRef }}/transitions"
+	headers = { Content-Type = "application/json" }
+	body_template = "{\"transition\":{\"id\":\"31\"}}"
+	success_status = [204]
 
 [[notify.jira.name-template]]
-name = "jira_default"
-message = "{{ .RuleName }} {{ .State }} {{ .Var }}={{ .MetricValue }} id={{ .ShortID }}"
-
-[rule.jira_tracker]
-alert_type = "count_total"
-
-[rule.jira_tracker.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"], service = ["api"] }
-
-[rule.jira_tracker.key]
-from_tags = ["dc", "service", "host"]
-
-[rule.jira_tracker.raise]
-n = 1
-
-[rule.jira_tracker.resolve]
-silence_sec = 1
-
-[rule.jira_tracker.pending]
-enabled = false
-delay_sec = 300
-
-[[rule.jira_tracker.notify.route]]
+	name = "jira_default"
+	message = "{{ .RuleName }} {{ .State }} {{ .Var }}={{ .MetricValue }} id={{ .ShortID }}"
+`, tracker.URL)
+			cfg += buildRuleTOML(ruleName, metric, e2eMetricVar, ruleOptions, fmt.Sprintf(`
+[[rule.%s.notify.route]]
 channel = "jira"
 template = "jira_default"
-`, port, natsURL, tracker.URL)
+`, ruleName))
 
-	if err := os.WriteFile(configPath, []byte(cfg), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
+			if err := os.WriteFile(configPath, []byte(cfg), 0o644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			service := newServiceFromConfig(t, configPath)
+			cancel, done := runService(t, service)
+			defer cancel()
+
+			baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+			waitReady(t, port)
+
+			postMetricEvent(t, baseURL, e2eMetricVar, "h1")
+
+			waitFor(t, 8*time.Second, func() bool {
+				return logs.countCreate() >= 1
+			})
+			if metricNeedsResolveEvent(metric) {
+				postMetricEvent(t, baseURL, e2eMetricVar, "h1")
+			}
+			waitFor(t, 10*time.Second, func() bool {
+				return logs.countResolve() >= 1
+			})
+
+			if logs.countCreate() != 1 {
+				t.Fatalf("expected exactly one create request, got %d", logs.countCreate())
+			}
+			if logs.countResolve() != 1 {
+				t.Fatalf("expected exactly one resolve request, got %d", logs.countResolve())
+			}
+			if gotPath := logs.resolvePath(); gotPath != "/rest/api/3/issue/OPS-777/transitions" {
+				t.Fatalf("resolve path mismatch: %s", gotPath)
+			}
+
+			cancel()
+			waitServiceStop(t, done)
+		})
 	}
-
-	service := newServiceFromConfig(t, configPath)
-	cancel, done := runService(t, service)
-	defer cancel()
-
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	waitReady(t, port)
-
-	eventJSON := []byte(`{"dt":1739876543210,"type":"event","tags":{"dc":"dc1","service":"api","host":"h1"},"var":"errors","value":{"t":"n","n":1},"agg_cnt":1,"win":0}`)
-	response, err := http.Post(baseURL+"/ingest", "application/json", bytes.NewReader(eventJSON))
-	if err != nil {
-		t.Fatalf("ingest request: %v", err)
-	}
-	_, _ = io.ReadAll(response.Body)
-	_ = response.Body.Close()
-	if response.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected ingest 202, got %d", response.StatusCode)
-	}
-
-	waitFor(t, 4*time.Second, func() bool {
-		return logs.countCreate() >= 1
-	})
-	waitFor(t, 6*time.Second, func() bool {
-		return logs.countResolve() >= 1
-	})
-
-	if logs.countCreate() != 1 {
-		t.Fatalf("expected exactly one create request, got %d", logs.countCreate())
-	}
-	if logs.countResolve() != 1 {
-		t.Fatalf("expected exactly one resolve request, got %d", logs.countResolve())
-	}
-	if gotPath := logs.resolvePath(); gotPath != "/rest/api/3/issue/OPS-777/transitions" {
-		t.Fatalf("resolve path mismatch: %s", gotPath)
-	}
-
-	cancel()
-	waitServiceStop(t, done)
 }

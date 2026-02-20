@@ -46,6 +46,18 @@ func (s *captureSender) Send(_ context.Context, notification domain.Notification
 	return SendResult{}, nil
 }
 
+type capturePermanentSender struct {
+	channel string
+	calls   int
+}
+
+func (s *capturePermanentSender) Channel() string { return s.channel }
+
+func (s *capturePermanentSender) Send(_ context.Context, _ domain.Notification) (SendResult, error) {
+	s.calls++
+	return SendResult{}, MarkPermanent(errors.New("permanent error"))
+}
+
 func TestDispatcherRetriesUntilSuccess(t *testing.T) {
 	t.Parallel()
 
@@ -92,8 +104,54 @@ func TestDispatcherReturnsUnknownChannel(t *testing.T) {
 	t.Parallel()
 
 	dispatcher := &Dispatcher{senders: map[string]ChannelSender{}}
-	if _, err := dispatcher.Send(context.Background(), "telegram", "telegram.main", domain.Notification{}); err == nil {
+	_, err := dispatcher.Send(context.Background(), "telegram", "telegram.main", domain.Notification{})
+	if err == nil {
 		t.Fatalf("expected unknown channel error")
+	}
+	if !IsPermanent(err) {
+		t.Fatalf("expected permanent error, got %v", err)
+	}
+}
+
+func TestDispatcherDoesNotRetryPermanentError(t *testing.T) {
+	t.Parallel()
+
+	sender := &capturePermanentSender{channel: "telegram"}
+	render, err := parseTemplate("test.permanent", "{{ .Message }}")
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	dispatcher := &Dispatcher{
+		senders: map[string]ChannelSender{"telegram": sender},
+		retries: map[string]config.NotifyRetry{
+			"telegram": {
+				Enabled:     true,
+				Backoff:     "exponential",
+				InitialMS:   1,
+				MaxMS:       2,
+				MaxAttempts: 10,
+			},
+		},
+		templates: map[string]compiledTemplate{
+			templateKey("telegram", "telegram.permanent"): {
+				channel: "telegram",
+				body:    render,
+			},
+		},
+	}
+
+	_, err = dispatcher.Send(context.Background(), "telegram", "telegram.permanent", domain.Notification{
+		AlertID: "rule/r/v/h",
+		Message: "firing",
+	})
+	if err == nil {
+		t.Fatalf("expected permanent error")
+	}
+	if !IsPermanent(err) {
+		t.Fatalf("expected permanent error, got %v", err)
+	}
+	if sender.calls != 1 {
+		t.Fatalf("expected one attempt for permanent error, got %d", sender.calls)
 	}
 }
 
@@ -312,6 +370,119 @@ func TestTelegramSenderSend(t *testing.T) {
 	}
 }
 
+func TestTelegramSenderActiveOnlyLifecycle(t *testing.T) {
+	t.Parallel()
+
+	type call struct {
+		Path      string
+		ChatID    string
+		MessageID string
+		Text      string
+	}
+	var (
+		mu    sync.Mutex
+		calls []call
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method=%s", r.Method)
+		}
+		if err := r.ParseMultipartForm(2 << 20); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		current := call{
+			Path:      r.URL.Path,
+			ChatID:    r.FormValue("chat_id"),
+			MessageID: r.FormValue("message_id"),
+			Text:      r.FormValue("text"),
+		}
+		mu.Lock()
+		calls = append(calls, current)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/bottoken/sendMessage":
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":101,"date":1,"chat":{"id":1,"type":"private"}}}`))
+		case "/bottoken/editMessageText":
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":101,"date":1,"chat":{"id":1,"type":"private"}}}`))
+		case "/bottoken/deleteMessage":
+			_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	sender := NewTelegramSender(config.TelegramNotifier{
+		Enabled:      true,
+		BotToken:     "token",
+		ChatID:       "history-chat",
+		ActiveChatID: "active-chat",
+		APIBase:      server.URL,
+	})
+
+	createResult, err := sender.Send(context.Background(), domain.Notification{
+		AlertID:   "rule/r/v/h",
+		RuleName:  "r",
+		Var:       "v",
+		State:     domain.AlertStateFiring,
+		RouteMode: config.NotifyRouteModeActiveOnly,
+		Message:   "firing",
+	})
+	if err != nil {
+		t.Fatalf("create send failed: %v", err)
+	}
+	if createResult.ExternalRef != "101" {
+		t.Fatalf("unexpected create external_ref=%q", createResult.ExternalRef)
+	}
+
+	updateResult, err := sender.Send(context.Background(), domain.Notification{
+		AlertID:     "rule/r/v/h",
+		RuleName:    "r",
+		Var:         "v",
+		State:       domain.AlertStateFiring,
+		RouteMode:   config.NotifyRouteModeActiveOnly,
+		ExternalRef: createResult.ExternalRef,
+		Message:     "repeat",
+	})
+	if err != nil {
+		t.Fatalf("update send failed: %v", err)
+	}
+	if updateResult.ExternalRef != "101" {
+		t.Fatalf("unexpected update external_ref=%q", updateResult.ExternalRef)
+	}
+
+	_, err = sender.Send(context.Background(), domain.Notification{
+		AlertID:     "rule/r/v/h",
+		RuleName:    "r",
+		Var:         "v",
+		State:       domain.AlertStateResolved,
+		RouteMode:   config.NotifyRouteModeActiveOnly,
+		ExternalRef: createResult.ExternalRef,
+		Message:     "resolved",
+	})
+	if err != nil {
+		t.Fatalf("delete send failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 telegram calls, got %d", len(calls))
+	}
+	if calls[0].Path != "/bottoken/sendMessage" || calls[0].ChatID != "active-chat" {
+		t.Fatalf("unexpected create call: %+v", calls[0])
+	}
+	if calls[1].Path != "/bottoken/editMessageText" || calls[1].ChatID != "active-chat" || calls[1].MessageID != "101" {
+		t.Fatalf("unexpected update call: %+v", calls[1])
+	}
+	if calls[2].Path != "/bottoken/deleteMessage" || calls[2].ChatID != "active-chat" || calls[2].MessageID != "101" {
+		t.Fatalf("unexpected delete call: %+v", calls[2])
+	}
+}
+
 func TestHTTPScenarioSenderSend(t *testing.T) {
 	t.Parallel()
 
@@ -507,6 +678,104 @@ func TestMattermostSenderResolvedRequiresExternalRef(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "mattermost resolved requires external_ref") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMattermostSenderActiveOnlyLifecycle(t *testing.T) {
+	t.Parallel()
+
+	type call struct {
+		Method string
+		Path   string
+		Body   string
+	}
+	var (
+		mu    sync.Mutex
+		calls []call
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := ioReadAllAndClose(r.Body)
+		mu.Lock()
+		calls = append(calls, call{Method: r.Method, Path: r.URL.Path, Body: string(body)})
+		mu.Unlock()
+
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v4/posts":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"post-1"}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v4/posts/post-1":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"post-1"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v4/posts/post-1":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"post-1","delete_at":1}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	sender := NewMattermostSender(config.MattermostConfig{
+		Enabled:         true,
+		BaseURL:         server.URL,
+		BotToken:        "token",
+		ChannelID:       "channel-history",
+		ActiveChannelID: "channel-active",
+		TimeoutSec:      2,
+	})
+
+	createResult, err := sender.Send(context.Background(), domain.Notification{
+		AlertID:   "rule/r/v/h",
+		State:     domain.AlertStateFiring,
+		RouteMode: config.NotifyRouteModeActiveOnly,
+		Message:   "firing",
+	})
+	if err != nil {
+		t.Fatalf("create send failed: %v", err)
+	}
+	if createResult.ExternalRef != "post-1" {
+		t.Fatalf("unexpected create external_ref=%q", createResult.ExternalRef)
+	}
+
+	updateResult, err := sender.Send(context.Background(), domain.Notification{
+		AlertID:     "rule/r/v/h",
+		State:       domain.AlertStateFiring,
+		RouteMode:   config.NotifyRouteModeActiveOnly,
+		ExternalRef: createResult.ExternalRef,
+		Message:     "repeat",
+	})
+	if err != nil {
+		t.Fatalf("update send failed: %v", err)
+	}
+	if updateResult.ExternalRef != "post-1" {
+		t.Fatalf("unexpected update external_ref=%q", updateResult.ExternalRef)
+	}
+
+	_, err = sender.Send(context.Background(), domain.Notification{
+		AlertID:     "rule/r/v/h",
+		State:       domain.AlertStateResolved,
+		RouteMode:   config.NotifyRouteModeActiveOnly,
+		ExternalRef: createResult.ExternalRef,
+		Message:     "resolved",
+	})
+	if err != nil {
+		t.Fatalf("delete send failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 calls, got %d", len(calls))
+	}
+	if calls[0].Method != http.MethodPost || calls[0].Path != "/api/v4/posts" || !strings.Contains(calls[0].Body, `"channel_id":"channel-active"`) {
+		t.Fatalf("unexpected create call: %+v", calls[0])
+	}
+	if calls[1].Method != http.MethodPut || calls[1].Path != "/api/v4/posts/post-1" || !strings.Contains(calls[1].Body, `"id":"post-1"`) {
+		t.Fatalf("unexpected update call: %+v", calls[1])
+	}
+	if calls[2].Method != http.MethodDelete || calls[2].Path != "/api/v4/posts/post-1" {
+		t.Fatalf("unexpected delete call: %+v", calls[2])
 	}
 }
 

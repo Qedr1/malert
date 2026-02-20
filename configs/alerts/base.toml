@@ -126,3 +126,13 @@ nack_delay_ms = 1000
 max_deliver = -1
 # Максимум unacked jobs у consumer.
 max_ack_pending = 4096
+
+[notify.queue.dlq]
+# Опциональный DLQ для jobs, которые не доставлены:
+# - permanent ошибки (конфиг/шаблон/маршрутизация),
+# - исчерпан max_deliver.
+enabled = true
+# Subject, куда worker пишет DLQ записи.
+subject = "alerting.notify.jobs.dlq"
+# Stream JetStream для DLQ subject.
+stream = "ALERTING_NOTIFY_DLQ"

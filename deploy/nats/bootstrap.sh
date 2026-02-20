@@ -18,6 +18,9 @@ fi
 : "${NOTIFY_STREAM:=ALERTING_NOTIFY}"
 : "${NOTIFY_SUBJECT:=alerting.notify.jobs}"
 : "${NOTIFY_STORAGE:=file}"
+: "${NOTIFY_DLQ_STREAM:=ALERTING_NOTIFY_DLQ}"
+: "${NOTIFY_DLQ_SUBJECT:=alerting.notify.jobs.dlq}"
+: "${NOTIFY_DLQ_STORAGE:=file}"
 : "${INGEST_CONSUMER:=alerting-ingest}"
 : "${INGEST_DELIVER_GROUP:=alerting-workers}"
 : "${INGEST_ACK_WAIT:=30s}"
@@ -88,6 +91,16 @@ if ! has_stream "$NOTIFY_STREAM"; then
     --retention work \
     --ack \
     --max-age 24h \
+    --defaults >/dev/null
+fi
+
+echo "[notify_queue] ensure DLQ stream: $NOTIFY_DLQ_STREAM ($NOTIFY_DLQ_SUBJECT)"
+if ! has_stream "$NOTIFY_DLQ_STREAM"; then
+  "${nats_cmd[@]}" stream add "$NOTIFY_DLQ_STREAM" \
+    --subjects "$NOTIFY_DLQ_SUBJECT" \
+    --storage "$NOTIFY_DLQ_STORAGE" \
+    --retention limits \
+    --max-age 168h \
     --defaults >/dev/null
 fi
 

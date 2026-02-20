@@ -1,10 +1,8 @@
 package e2e
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -60,116 +58,141 @@ func (c *notificationCollector) Total() int {
 	return len(c.items)
 }
 
+func (c *notificationCollector) Snapshot() []domain.Notification {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]domain.Notification, len(c.items))
+	copy(out, c.items)
+	return out
+}
+
 func TestHotReloadApplyValidSnapshot(t *testing.T) {
-	port, err := freePort()
-	if err != nil {
-		t.Fatalf("free port: %v", err)
+	for _, metric := range allE2EMetricCases() {
+		metric := metric
+		t.Run(metric.Name, func(t *testing.T) {
+			port, err := freePort()
+			if err != nil {
+				t.Fatalf("free port: %v", err)
+			}
+			natsURL, stopNATS := startLocalNATSServer(t)
+			defer stopNATS()
+
+			collector := &notificationCollector{}
+			webhook := httptest.NewServer(http.HandlerFunc(collector.Handle))
+			defer webhook.Close()
+
+			tmpDir := t.TempDir()
+			configPath := filepath.Join(tmpDir, "config.toml")
+			if err := os.WriteFile(configPath, []byte(reloadConfigTOML(port, natsURL, webhook.URL, metric, "rule_old", "errors", false, true)), 0o644); err != nil {
+				t.Fatalf("write initial config: %v", err)
+			}
+
+			service := newServiceFromConfig(t, configPath)
+			cancel, done := runService(t, service)
+			defer cancel()
+
+			baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+			waitReady(t, port)
+
+			sendEvent(t, baseURL, "errors", "h1")
+			time.Sleep(300 * time.Millisecond)
+			if collector.Total() != 0 {
+				t.Fatalf("expected no notifications before reload threshold update")
+			}
+
+			if err := os.WriteFile(configPath, []byte(reloadConfigTOML(port, natsURL, webhook.URL, metric, "rule_new", "latency", true, true)), 0o644); err != nil {
+				t.Fatalf("write reloaded config: %v", err)
+			}
+			time.Sleep(1500 * time.Millisecond)
+
+			if metricNeedsResolveEvent(metric) {
+				sendEvent(t, baseURL, "latency", "h10")
+				waitFor(t, 10*time.Second, func() bool {
+					return collector.Count("rule_new", domain.AlertStateFiring) >= 1
+				})
+			} else {
+				nextHost := 10
+				waitFor(t, 8*time.Second, func() bool {
+					sendEvent(t, baseURL, "latency", fmt.Sprintf("h%d", nextHost))
+					nextHost++
+					return collector.Count("rule_new", domain.AlertStateFiring) >= 1
+				})
+			}
+
+			before := collector.Total()
+			sendEvent(t, baseURL, "errors", "h999")
+			time.Sleep(300 * time.Millisecond)
+			after := collector.Total()
+			if after != before {
+				t.Fatalf("old rule produced notification after reload: before=%d after=%d", before, after)
+			}
+
+			cancel()
+			waitServiceStop(t, done)
+		})
 	}
-	natsURL, stopNATS := startLocalNATSServer(t)
-	defer stopNATS()
-
-	collector := &notificationCollector{}
-	webhook := httptest.NewServer(http.HandlerFunc(collector.Handle))
-	defer webhook.Close()
-
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.toml")
-	if err := os.WriteFile(configPath, []byte(reloadConfigTOML(port, natsURL, webhook.URL, "rule_old", "errors", false, true)), 0o644); err != nil {
-		t.Fatalf("write initial config: %v", err)
-	}
-
-	service := newServiceFromConfig(t, configPath)
-	cancel, done := runService(t, service)
-	defer cancel()
-
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	waitReady(t, port)
-
-	sendEvent(t, baseURL, "errors", "h1")
-	time.Sleep(300 * time.Millisecond)
-	if collector.Total() != 0 {
-		t.Fatalf("expected no notifications before reload threshold update")
-	}
-
-	if err := os.WriteFile(configPath, []byte(reloadConfigTOML(port, natsURL, webhook.URL, "rule_new", "latency", true, true)), 0o644); err != nil {
-		t.Fatalf("write reloaded config: %v", err)
-	}
-
-	nextHost := 10
-	waitFor(t, 6*time.Second, func() bool {
-		sendEvent(t, baseURL, "latency", fmt.Sprintf("h%d", nextHost))
-		nextHost++
-		return collector.Count("rule_new", domain.AlertStateFiring) >= 1
-	})
-
-	before := collector.Total()
-	sendEvent(t, baseURL, "errors", "h999")
-	time.Sleep(300 * time.Millisecond)
-	after := collector.Total()
-	if after != before {
-		t.Fatalf("old rule produced notification after reload: before=%d after=%d", before, after)
-	}
-
-	cancel()
-	waitServiceStop(t, done)
 }
 
 func TestHotReloadKeepsPreviousSnapshotOnValidationError(t *testing.T) {
-	port, err := freePort()
-	if err != nil {
-		t.Fatalf("free port: %v", err)
+	for _, metric := range allE2EMetricCases() {
+		metric := metric
+		t.Run(metric.Name, func(t *testing.T) {
+			port, err := freePort()
+			if err != nil {
+				t.Fatalf("free port: %v", err)
+			}
+			natsURL, stopNATS := startLocalNATSServer(t)
+			defer stopNATS()
+
+			collector := &notificationCollector{}
+			webhook := httptest.NewServer(http.HandlerFunc(collector.Handle))
+			defer webhook.Close()
+
+			tmpDir := t.TempDir()
+			configPath := filepath.Join(tmpDir, "config.toml")
+			if err := os.WriteFile(configPath, []byte(reloadConfigTOML(port, natsURL, webhook.URL, metric, "rule_stable", "errors", true, true)), 0o644); err != nil {
+				t.Fatalf("write initial config: %v", err)
+			}
+
+			service := newServiceFromConfig(t, configPath)
+			cancel, done := runService(t, service)
+			defer cancel()
+
+			baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+			waitReady(t, port)
+			waitTimeout := 6 * time.Second
+			if metricNeedsResolveEvent(metric) {
+				waitTimeout = 10 * time.Second
+			}
+
+			sendEvent(t, baseURL, "errors", "s1")
+			waitFor(t, waitTimeout, func() bool {
+				return collector.Count("rule_stable", domain.AlertStateFiring) >= 1
+			})
+
+			if err := os.WriteFile(configPath, []byte(reloadConfigTOML(port, natsURL, webhook.URL, metric, "rule_broken", "latency", true, false)), 0o644); err != nil {
+				t.Fatalf("write invalid config: %v", err)
+			}
+			time.Sleep(1500 * time.Millisecond)
+
+			sendEvent(t, baseURL, "errors", "s2")
+			waitFor(t, waitTimeout, func() bool {
+				return collector.Count("rule_stable", domain.AlertStateFiring) >= 2
+			})
+
+			cancel()
+			waitServiceStop(t, done)
+		})
 	}
-	natsURL, stopNATS := startLocalNATSServer(t)
-	defer stopNATS()
-
-	collector := &notificationCollector{}
-	webhook := httptest.NewServer(http.HandlerFunc(collector.Handle))
-	defer webhook.Close()
-
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.toml")
-	if err := os.WriteFile(configPath, []byte(reloadConfigTOML(port, natsURL, webhook.URL, "rule_stable", "errors", true, true)), 0o644); err != nil {
-		t.Fatalf("write initial config: %v", err)
-	}
-
-	service := newServiceFromConfig(t, configPath)
-	cancel, done := runService(t, service)
-	defer cancel()
-
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	waitReady(t, port)
-
-	sendEvent(t, baseURL, "errors", "s1")
-	waitFor(t, 3*time.Second, func() bool {
-		return collector.Count("rule_stable", domain.AlertStateFiring) >= 1
-	})
-
-	if err := os.WriteFile(configPath, []byte(reloadConfigTOML(port, natsURL, webhook.URL, "rule_broken", "latency", true, false)), 0o644); err != nil {
-		t.Fatalf("write invalid config: %v", err)
-	}
-	time.Sleep(1500 * time.Millisecond)
-
-	sendEvent(t, baseURL, "errors", "s2")
-	waitFor(t, 3*time.Second, func() bool {
-		return collector.Count("rule_stable", domain.AlertStateFiring) >= 2
-	})
-
-	cancel()
-	waitServiceStop(t, done)
 }
 
-func reloadConfigTOML(port int, natsURL, webhookURL, ruleName, metricVar string, emitOnFirstEvent bool, withRule bool) string {
-	raiseN := 2
-	if emitOnFirstEvent {
-		raiseN = 1
-	}
-
+func reloadConfigTOML(port int, natsURL, webhookURL string, metric e2eMetricCase, ruleName, metricVar string, emitOnFirstEvent bool, withRule bool) string {
 	base := fmt.Sprintf(`
 [service]
 name = "alerting"
 reload_enabled = true
 reload_interval_sec = 1
-resolve_scan_interval_sec = 60
+resolve_scan_interval_sec = 1
 
 [log.console]
 enabled = true
@@ -219,41 +242,32 @@ message = "{{ .Message }}"
 		return base
 	}
 
-	return base + fmt.Sprintf(`
-[rule.%[1]s]
-alert_type = "count_total"
+	options := defaultE2ERuleOptions(metric)
+	if emitOnFirstEvent {
+		switch metric.AlertType {
+		case "count_total", "count_window":
+			options.RaiseN = 1
+		default:
+			options.MissingSec = 1
+		}
+	} else {
+		switch metric.AlertType {
+		case "count_total", "count_window":
+			options.RaiseN = 2
+			options.ResolveSilenceSec = 3600
+		default:
+			options.MissingSec = 3600
+		}
+	}
 
-[rule.%[1]s.match]
-type = ["event"]
-var = ["%[2]s"]
-tags = { dc = ["dc1"], service = ["api"] }
-
-[rule.%[1]s.key]
-from_tags = ["dc", "service", "host"]
-
-[rule.%[1]s.raise]
-n = %[3]d
-
-[rule.%[1]s.resolve]
-silence_sec = 3600
-
+	return base + buildRuleTOML(ruleName, metric, metricVar, options, fmt.Sprintf(`
 [[rule.%[1]s.notify.route]]
 channel = "http"
 template = "http_default"
-`, ruleName, metricVar, raiseN)
+`, ruleName))
 }
 
 func sendEvent(t *testing.T, baseURL, metricVar, host string) {
 	t.Helper()
-
-	body := []byte(fmt.Sprintf(`{"dt":%d,"type":"event","tags":{"dc":"dc1","service":"api","host":"%s"},"var":"%s","value":{"t":"n","n":1},"agg_cnt":1,"win":0}`, time.Now().UnixMilli(), host, metricVar))
-	response, err := http.Post(baseURL+"/ingest", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("ingest request: %v", err)
-	}
-	defer response.Body.Close()
-	_, _ = io.ReadAll(response.Body)
-	if response.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected ingest 202, got %d", response.StatusCode)
-	}
+	postMetricEvent(t, baseURL, metricVar, host)
 }

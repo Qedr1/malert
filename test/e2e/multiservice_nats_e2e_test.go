@@ -15,72 +15,125 @@ import (
 )
 
 func TestMultiServiceNATSQueueLifecycleSingleNotifications(t *testing.T) {
-	natsURL, stopNATS := startLocalNATSServer(t)
-	defer stopNATS()
+	for _, metric := range allE2EMetricCases() {
+		metric := metric
+		t.Run(metric.Name, func(t *testing.T) {
+			natsURL, stopNATS := startLocalNATSServer(t)
+			defer stopNATS()
 
-	ensureEventStream(t, natsURL, e2eEventsStream, e2eEventsSubj)
-	ensureStateBuckets(t, natsURL, e2eTickBucket, e2eDataBucket)
+			ensureEventStream(t, natsURL, e2eEventsStream, e2eEventsSubj)
+			ensureStateBuckets(t, natsURL, e2eTickBucket, e2eDataBucket)
 
-	collector := &notificationCollector{}
-	webhook := httptest.NewServer(http.HandlerFunc(collector.Handle))
-	defer webhook.Close()
+			collector := &notificationCollector{}
+			webhook := httptest.NewServer(http.HandlerFunc(collector.Handle))
+			defer webhook.Close()
 
-	portA, err := freePort()
-	if err != nil {
-		t.Fatalf("free port A: %v", err)
+			portA, err := freePort()
+			if err != nil {
+				t.Fatalf("free port A: %v", err)
+			}
+			portB, err := freePort()
+			if err != nil {
+				t.Fatalf("free port B: %v", err)
+			}
+
+			ruleName := "nats_multi_" + metric.Name
+			ruleOptions := defaultE2ERuleOptions(metric)
+			switch metric.AlertType {
+			case "count_total", "count_window":
+				ruleOptions.ResolveSilenceSec = 2
+			default:
+				ruleOptions.MissingSec = 2
+			}
+
+			tmpDir := t.TempDir()
+			cfgAPath := filepath.Join(tmpDir, "svc-a.toml")
+			cfgBPath := filepath.Join(tmpDir, "svc-b.toml")
+			if err := os.WriteFile(cfgAPath, []byte(multiserviceNATSConfigTOML(portA, webhook.URL, natsURL, "svc-a", metric, ruleName, ruleOptions)), 0o644); err != nil {
+				t.Fatalf("write config A: %v", err)
+			}
+			if err := os.WriteFile(cfgBPath, []byte(multiserviceNATSConfigTOML(portB, webhook.URL, natsURL, "svc-b", metric, ruleName, ruleOptions)), 0o644); err != nil {
+				t.Fatalf("write config B: %v", err)
+			}
+
+			serviceA := newServiceFromConfig(t, cfgAPath)
+			serviceB := newServiceFromConfig(t, cfgBPath)
+
+			cancelA, doneA := runService(t, serviceA)
+			defer cancelA()
+			cancelB, doneB := runService(t, serviceB)
+			defer cancelB()
+
+			waitReady(t, portA)
+			waitReady(t, portB)
+
+			if err := publishNATSEvent(natsURL, e2eEventsSubj, fmt.Sprintf(`{"dt":%d,"type":"event","tags":{"dc":"dc1","service":"api","host":"h1"},"var":"%s","value":{"t":"n","n":1},"agg_cnt":1,"win":0}`, time.Now().UnixMilli(), e2eMetricVar)); err != nil {
+				t.Fatalf("publish nats event: %v", err)
+			}
+
+			if !waitUntil(10*time.Second, func() bool {
+				return collector.Count(ruleName, domain.AlertStateFiring) >= 1
+			}) {
+				t.Fatalf("missing firing notification for %s: total=%d snapshot=%+v", ruleName, collector.Total(), collector.Snapshot())
+			}
+			if metricNeedsResolveEvent(metric) {
+				resolveDeadline := time.Now().Add(12 * time.Second)
+				for collector.Count(ruleName, domain.AlertStateResolved) < 1 && time.Now().Before(resolveDeadline) {
+					if err := publishNATSEvent(natsURL, e2eEventsSubj, fmt.Sprintf(`{"dt":%d,"type":"event","tags":{"dc":"dc1","service":"api","host":"h1"},"var":"%s","value":{"t":"n","n":1},"agg_cnt":1,"win":0}`, time.Now().UnixMilli(), e2eMetricVar)); err != nil {
+						t.Fatalf("publish nats resolve event: %v", err)
+					}
+					time.Sleep(300 * time.Millisecond)
+				}
+				if collector.Count(ruleName, domain.AlertStateResolved) < 1 {
+					t.Fatalf("missing resolved notification for %s: total=%d snapshot=%+v", ruleName, collector.Total(), collector.Snapshot())
+				}
+			} else {
+				if !waitUntil(12*time.Second, func() bool {
+					return collector.Count(ruleName, domain.AlertStateResolved) >= 1
+				}) {
+					t.Fatalf("missing resolved notification for %s: total=%d snapshot=%+v", ruleName, collector.Total(), collector.Snapshot())
+				}
+			}
+
+			time.Sleep(1200 * time.Millisecond)
+			firing := collector.Count(ruleName, domain.AlertStateFiring)
+			resolved := collector.Count(ruleName, domain.AlertStateResolved)
+			if metricNeedsResolveEvent(metric) {
+				if firing < 1 {
+					t.Fatalf("expected firing notifications >=1, got %d", firing)
+				}
+				if resolved < 1 {
+					t.Fatalf("expected resolved notifications >=1, got %d", resolved)
+				}
+			} else {
+				if firing != 1 {
+					t.Fatalf("expected single firing notification, got %d", firing)
+				}
+				if resolved != 1 {
+					t.Fatalf("expected single resolved notification, got %d", resolved)
+				}
+				if total := collector.Total(); total != 2 {
+					t.Fatalf("expected exactly 2 notifications total, got %d", total)
+				}
+			}
+
+			cancelA()
+			cancelB()
+			waitServiceStop(t, doneA)
+			waitServiceStop(t, doneB)
+		})
 	}
-	portB, err := freePort()
-	if err != nil {
-		t.Fatalf("free port B: %v", err)
+}
+
+func waitUntil(timeout time.Duration, check func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if check() {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-
-	tmpDir := t.TempDir()
-	cfgAPath := filepath.Join(tmpDir, "svc-a.toml")
-	cfgBPath := filepath.Join(tmpDir, "svc-b.toml")
-	if err := os.WriteFile(cfgAPath, []byte(multiserviceNATSConfigTOML(portA, webhook.URL, natsURL, "svc-a")), 0o644); err != nil {
-		t.Fatalf("write config A: %v", err)
-	}
-	if err := os.WriteFile(cfgBPath, []byte(multiserviceNATSConfigTOML(portB, webhook.URL, natsURL, "svc-b")), 0o644); err != nil {
-		t.Fatalf("write config B: %v", err)
-	}
-
-	serviceA := newServiceFromConfig(t, cfgAPath)
-	serviceB := newServiceFromConfig(t, cfgBPath)
-
-	cancelA, doneA := runService(t, serviceA)
-	defer cancelA()
-	cancelB, doneB := runService(t, serviceB)
-	defer cancelB()
-
-	waitReady(t, portA)
-	waitReady(t, portB)
-
-	if err := publishNATSEvent(natsURL, e2eEventsSubj, `{"dt":1739876543210,"type":"event","tags":{"dc":"dc1","service":"api","host":"h1"},"var":"errors","value":{"t":"n","n":1},"agg_cnt":1,"win":0}`); err != nil {
-		t.Fatalf("publish nats event: %v", err)
-	}
-
-	waitFor(t, 8*time.Second, func() bool {
-		return collector.Count("ct_nats_multi", domain.AlertStateFiring) >= 1
-	})
-	waitFor(t, 12*time.Second, func() bool {
-		return collector.Count("ct_nats_multi", domain.AlertStateResolved) >= 1
-	})
-
-	time.Sleep(1200 * time.Millisecond)
-	if firing := collector.Count("ct_nats_multi", domain.AlertStateFiring); firing != 1 {
-		t.Fatalf("expected single firing notification, got %d", firing)
-	}
-	if resolved := collector.Count("ct_nats_multi", domain.AlertStateResolved); resolved != 1 {
-		t.Fatalf("expected single resolved notification, got %d", resolved)
-	}
-	if total := collector.Total(); total != 2 {
-		t.Fatalf("expected exactly 2 notifications total, got %d", total)
-	}
-
-	cancelA()
-	cancelB()
-	waitServiceStop(t, doneA)
-	waitServiceStop(t, doneB)
+	return false
 }
 
 func publishNATSEvent(url, subject, body string) error {
@@ -95,8 +148,8 @@ func publishNATSEvent(url, subject, body string) error {
 	return nc.FlushTimeout(3 * time.Second)
 }
 
-func multiserviceNATSConfigTOML(port int, webhookURL, natsURL, serviceName string) string {
-	return fmt.Sprintf(`
+func multiserviceNATSConfigTOML(port int, webhookURL, natsURL, serviceName string, metric e2eMetricCase, ruleName string, ruleOptions e2eRuleOptions) string {
+	base := fmt.Sprintf(`
 [service]
 name = "%s"
 reload_enabled = false
@@ -148,30 +201,10 @@ enabled = false
 [[notify.http.name-template]]
 name = "http_default"
 message = "[{{ .RuleName }}] {{ .Message }} state={{ .State }}"
-
-[rule.ct_nats_multi]
-alert_type = "count_total"
-
-[rule.ct_nats_multi.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"], service = ["api"] }
-
-[rule.ct_nats_multi.key]
-from_tags = ["dc", "service", "host"]
-
-[rule.ct_nats_multi.raise]
-n = 1
-
-[rule.ct_nats_multi.resolve]
-silence_sec = 2
-
-[rule.ct_nats_multi.pending]
-enabled = false
-delay_sec = 300
-
-[[rule.ct_nats_multi.notify.route]]
+`, serviceName, port, natsURL, e2eEventsSubj, e2eEventsStream, webhookURL)
+	return base + buildRuleTOML(ruleName, metric, e2eMetricVar, ruleOptions, fmt.Sprintf(`
+[[rule.%s.notify.route]]
 channel = "http"
 template = "http_default"
-`, serviceName, port, natsURL, e2eEventsSubj, e2eEventsStream, webhookURL)
+`, ruleName))
 }

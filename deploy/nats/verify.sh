@@ -18,6 +18,8 @@ fi
 : "${NOTIFY_STREAM:=ALERTING_NOTIFY}"
 : "${NOTIFY_SUBJECT:=alerting.notify.jobs}"
 : "${NOTIFY_CONSUMER:=alerting-notify}"
+: "${NOTIFY_DLQ_STREAM:=ALERTING_NOTIFY_DLQ}"
+: "${NOTIFY_DLQ_SUBJECT:=alerting.notify.jobs.dlq}"
 : "${TICK_BUCKET:=tick}"
 : "${DATA_BUCKET:=data}"
 : "${RESOLVE_CONSUMER:=alerting-resolve}"
@@ -38,6 +40,8 @@ echo "[notify_queue] stream info: $NOTIFY_STREAM"
 "${nats_cmd[@]}" stream info "$NOTIFY_STREAM" >/dev/null
 echo "[notify_queue] consumer info: $NOTIFY_STREAM/$NOTIFY_CONSUMER"
 "${nats_cmd[@]}" consumer info "$NOTIFY_STREAM" "$NOTIFY_CONSUMER" >/dev/null
+echo "[notify_queue] DLQ stream info: $NOTIFY_DLQ_STREAM"
+"${nats_cmd[@]}" stream info "$NOTIFY_DLQ_STREAM" >/dev/null
 
 echo "[state] kv info: $TICK_BUCKET"
 "${nats_cmd[@]}" kv info "$TICK_BUCKET" >/dev/null
@@ -48,4 +52,4 @@ echo "[state] stream info: KV_${TICK_BUCKET}"
 echo "[state] consumer info: KV_${TICK_BUCKET}/$RESOLVE_CONSUMER"
 "${nats_cmd[@]}" consumer info "KV_${TICK_BUCKET}" "$RESOLVE_CONSUMER" >/dev/null
 
-echo "[done] NATS deploy verification OK (subjects: $EVENTS_SUBJECT, $NOTIFY_SUBJECT)"
+echo "[done] NATS deploy verification OK (subjects: $EVENTS_SUBJECT, $NOTIFY_SUBJECT, $NOTIFY_DLQ_SUBJECT)"

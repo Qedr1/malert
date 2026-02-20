@@ -1,10 +1,8 @@
 package e2e
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -84,134 +82,94 @@ func (m *telegramAPIMock) Snapshot() []telegramCapturedRequest {
 }
 
 func TestTelegramResolvedRepliesToOpeningMessage(t *testing.T) {
-	port, err := freePort()
-	if err != nil {
-		t.Fatalf("free port: %v", err)
-	}
-	natsURL, stopNATS := startLocalNATSServer(t)
-	defer stopNATS()
+	for _, metric := range allE2EMetricCases() {
+		metric := metric
+		t.Run(metric.Name, func(t *testing.T) {
+			port, err := freePort()
+			if err != nil {
+				t.Fatalf("free port: %v", err)
+			}
+			natsURL, stopNATS := startLocalNATSServer(t)
+			defer stopNATS()
 
-	mock := &telegramAPIMock{}
-	telegramServer := httptest.NewServer(http.HandlerFunc(mock.Handle))
-	defer telegramServer.Close()
+			mock := &telegramAPIMock{}
+			telegramServer := httptest.NewServer(http.HandlerFunc(mock.Handle))
+			defer telegramServer.Close()
 
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.toml")
-	if err := os.WriteFile(configPath, []byte(telegramReplyConfigTOML(port, natsURL, telegramServer.URL)), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+			tmpDir := t.TempDir()
+			configPath := filepath.Join(tmpDir, "config.toml")
+			if err := os.WriteFile(configPath, []byte(telegramReplyConfigTOML(port, natsURL, telegramServer.URL, metric)), 0o644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
 
-	service := newServiceFromConfig(t, configPath)
-	cancel, done := runService(t, service)
-	defer cancel()
+			service := newServiceFromConfig(t, configPath)
+			cancel, done := runService(t, service)
+			defer cancel()
 
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	waitReady(t, port)
+			baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+			waitReady(t, port)
 
-	body := []byte(fmt.Sprintf(`{"dt":%d,"type":"event","tags":{"dc":"dc1","service":"api","host":"h1"},"var":"errors","value":{"t":"n","n":1},"agg_cnt":1,"win":0}`, time.Now().UnixMilli()))
-	response, err := http.Post(baseURL+"/ingest", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("ingest request: %v", err)
-	}
-	_, _ = io.ReadAll(response.Body)
-	_ = response.Body.Close()
-	if response.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected ingest 202, got %d", response.StatusCode)
-	}
+			postMetricEvent(t, baseURL, e2eMetricVar, "h1")
+			waitFor(t, 8*time.Second, func() bool {
+				return len(mock.Snapshot()) >= 1
+			})
+			if metricNeedsResolveEvent(metric) {
+				postMetricEvent(t, baseURL, e2eMetricVar, "h1")
+			}
 
-	waitFor(t, 5*time.Second, func() bool {
-		return len(mock.Snapshot()) >= 2
-	})
+			waitFor(t, 8*time.Second, func() bool {
+				return len(mock.Snapshot()) >= 2
+			})
 
-	requests := mock.Snapshot()
-	if len(requests) < 2 {
-		t.Fatalf("expected at least 2 telegram notifications, got %d", len(requests))
-	}
-	first := requests[0]
-	second := requests[1]
-	if first.Payload.Reply != nil {
-		t.Fatalf("first telegram message must not reply to another message")
-	}
-	if !strings.Contains(first.Payload.Text, "state=firing") {
-		t.Fatalf("first message text mismatch: %s", first.Payload.Text)
-	}
-	if second.Payload.Reply == nil {
-		t.Fatalf("resolved telegram message must contain reply_parameters")
-	}
-	if second.Payload.Reply.MessageID != first.MessageID {
-		t.Fatalf("resolved reply target mismatch: got=%d want=%d", second.Payload.Reply.MessageID, first.MessageID)
-	}
-	if !strings.Contains(second.Payload.Text, "state=resolved") {
-		t.Fatalf("second message text mismatch: %s", second.Payload.Text)
-	}
+			requests := mock.Snapshot()
+			if len(requests) < 2 {
+				t.Fatalf("expected at least 2 telegram notifications, got %d", len(requests))
+			}
+			first := requests[0]
+			second := requests[1]
+			if first.Payload.Reply != nil {
+				t.Fatalf("first telegram message must not reply to another message")
+			}
+			if !strings.Contains(first.Payload.Text, "state=firing") {
+				t.Fatalf("first message text mismatch: %s", first.Payload.Text)
+			}
+			if second.Payload.Reply == nil {
+				t.Fatalf("resolved telegram message must contain reply_parameters")
+			}
+			if second.Payload.Reply.MessageID != first.MessageID {
+				t.Fatalf("resolved reply target mismatch: got=%d want=%d", second.Payload.Reply.MessageID, first.MessageID)
+			}
+			if !strings.Contains(second.Payload.Text, "state=resolved") {
+				t.Fatalf("second message text mismatch: %s", second.Payload.Text)
+			}
 
-	cancel()
-	waitServiceStop(t, done)
+			cancel()
+			waitServiceStop(t, done)
+		})
+	}
 }
 
-func telegramReplyConfigTOML(port int, natsURL, telegramAPIBase string) string {
-	return fmt.Sprintf(`
-[service]
-name = "alerting"
-reload_enabled = false
-resolve_scan_interval_sec = 1
+func telegramReplyConfigTOML(port int, natsURL, telegramAPIBase string, metric e2eMetricCase) string {
+	ruleName := "ct_telegram_" + metric.Name
+	options := defaultE2ERuleOptions(metric)
 
-[log.console]
-enabled = true
-level = "error"
-format = "line"
-
-[ingest.http]
-enabled = true
-listen = "127.0.0.1:%d"
-health_path = "/healthz"
-ready_path = "/readyz"
-ingest_path = "/ingest"
-max_body_bytes = 1048576
-
-[ingest.nats]
-enabled = false
-url = ["%s"]
-
-[notify]
-repeat = false
-repeat_every_sec = 300
-repeat_on = ["firing"]
-repeat_per_channel = true
-on_pending = false
-
+	base := e2eStandardConfigPrefix(port, natsURL) + fmt.Sprintf(`
 [notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "1001"
-api_base = "%s"
+	enabled = true
+	bot_token = "token"
+	chat_id = "1001"
+	api_base = "%s"
 
 [notify.telegram.retry]
-enabled = false
+	enabled = false
 
 [[notify.telegram.name-template]]
-name = "tg_default"
-message = "[{{ .RuleName }}] {{ .Message }}\nalert_id={{ .AlertID }}\nstate={{ .State }}"
-
-[rule.ct_telegram]
-alert_type = "count_total"
-
-[rule.ct_telegram.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"], service = ["api"] }
-
-[rule.ct_telegram.key]
-from_tags = ["dc", "service", "host"]
-
-[rule.ct_telegram.raise]
-n = 1
-
-[rule.ct_telegram.resolve]
-silence_sec = 1
-
-[[rule.ct_telegram.notify.route]]
+	name = "tg_default"
+	message = "[{{ .RuleName }}] {{ .Message }}\nalert_id={{ .AlertID }}\nstate={{ .State }}"
+`, telegramAPIBase)
+	return base + buildRuleTOML(ruleName, metric, e2eMetricVar, options, fmt.Sprintf(`
+[[rule.%s.notify.route]]
 channel = "telegram"
 template = "tg_default"
-`, port, natsURL, telegramAPIBase)
+`, ruleName))
 }

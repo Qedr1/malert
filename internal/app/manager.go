@@ -150,7 +150,11 @@ func (m *Manager) Tick(ctx context.Context) error {
 			}
 
 			for _, route := range routes {
-				notifyKey := route.Channel
+				normalizedRoute, ok := normalizedRouteFromRuntimeRoute(route)
+				if !ok {
+					continue
+				}
+				notifyKey := normalizedRoute.Key
 				last := runtimeState.LastNotified[notifyKey]
 				if !last.IsZero() && now.Sub(last) < repeatEvery {
 					continue
@@ -517,10 +521,28 @@ func (m *Manager) notificationMessage(stateValue domain.AlertState, resolveCause
 	}
 }
 
+// normalizedNotifyRoute stores canonical route metadata used by runtime.
+// Params: normalized route fields from config.
+// Returns: deterministic route descriptor.
+type normalizedNotifyRoute struct {
+	Key      string
+	Channel  string
+	Template string
+	Mode     string
+}
+
+// routeSendResult keeps route context with channel send result.
+// Params: route metadata and transport result.
+// Returns: one delivery outcome item.
+type routeSendResult struct {
+	Route  normalizedNotifyRoute
+	Result notify.SendResult
+}
+
 // notifyRoutes sends notification using explicit rule routes.
 // Params: base notification payload and route bindings (channel+template).
 // Returns: channel send metadata or first send error when any route fails.
-func (m *Manager) notifyRoutes(ctx context.Context, notification domain.Notification, routes []config.RuleNotifyRoute, dropTrackerWithoutRef bool) (map[string]notify.SendResult, error) {
+func (m *Manager) notifyRoutes(ctx context.Context, notification domain.Notification, routes []config.RuleNotifyRoute, dropTrackerWithoutRef bool) ([]routeSendResult, error) {
 	dispatcher := m.dispatcherSnapshot()
 	if dispatcher == nil {
 		return nil, nil
@@ -528,28 +550,31 @@ func (m *Manager) notifyRoutes(ctx context.Context, notification domain.Notifica
 	if len(routes) == 0 {
 		return nil, nil
 	}
-	results := make(map[string]notify.SendResult, len(routes))
+	results := make([]routeSendResult, 0, len(routes))
 	for _, route := range routes {
-		channel, templateName, ok := normalizeNotifyRoute(route)
+		normalizedRoute, ok := normalizedRouteFromRuntimeRoute(route)
 		if !ok {
 			continue
 		}
-		perChannel, ok := m.prepareNotificationForChannel(notification, channel)
+		perRoute, ok := m.prepareNotificationForRoute(notification, normalizedRoute)
 		if !ok {
 			continue
 		}
 		if dropTrackerWithoutRef &&
-			perChannel.State == domain.AlertStateResolved &&
-			(channel == config.NotifyChannelJira || channel == config.NotifyChannelYouTrack) &&
-			strings.TrimSpace(perChannel.ExternalRef) == "" {
-			m.logger.Warn("drop tracker resolved notification without external ref", "channel", channel, "alert_id", perChannel.AlertID)
+			perRoute.State == domain.AlertStateResolved &&
+			(normalizedRoute.Channel == config.NotifyChannelJira || normalizedRoute.Channel == config.NotifyChannelYouTrack) &&
+			strings.TrimSpace(perRoute.ExternalRef) == "" {
+			m.logger.Warn("drop tracker resolved notification without external ref", "channel", normalizedRoute.Channel, "alert_id", perRoute.AlertID)
 			continue
 		}
-		result, err := dispatcher.Send(ctx, channel, templateName, perChannel)
+		result, err := dispatcher.Send(ctx, normalizedRoute.Channel, normalizedRoute.Template, perRoute)
 		if err != nil {
 			return nil, err
 		}
-		results[channel] = result
+		results = append(results, routeSendResult{
+			Route:  normalizedRoute,
+			Result: result,
+		})
 	}
 	return results, nil
 }
@@ -617,48 +642,39 @@ func (m *Manager) dispatchNotification(ctx context.Context, rule config.RuleConf
 	if err != nil {
 		return err
 	}
-	m.captureOpeningTelegramMessageID(notification.AlertID, notification.State, results)
-	m.captureExternalRefs(notification.AlertID, results)
-	m.captureLastNotified(notification.AlertID, notification.Timestamp, results)
-	if notification.State == domain.AlertStateFiring {
-		if err := m.persistExternalRefs(ctx, notification.AlertID, results); err != nil {
-			return err
-		}
-	}
-	return nil
+	return m.applyDeliveryResults(ctx, notification, results)
 }
 
 // ProcessQueuedNotification delivers one queued notification job via dispatcher.
 // Params: queued delivery job produced by manager enqueue path.
 // Returns: delivery error for worker NAK/redelivery.
 func (m *Manager) ProcessQueuedNotification(ctx context.Context, job notifyqueue.Job) error {
-	channel, templateName, ok := normalizeNotifyRoute(config.RuleNotifyRoute{
+	normalizedRoute, ok := normalizedRouteFromRuntimeRoute(config.RuleNotifyRoute{
+		Name:     job.RouteKey,
 		Channel:  job.Channel,
 		Template: job.Template,
+		Mode:     job.RouteMode,
 	})
 	if !ok {
 		return nil
 	}
 
 	notification := job.Notification
-	results, err := m.notifyRoutes(ctx, notification, []config.RuleNotifyRoute{{Channel: channel, Template: templateName}}, true)
+	results, err := m.notifyRoutes(ctx, notification, []config.RuleNotifyRoute{{
+		Name:     normalizedRoute.Key,
+		Channel:  normalizedRoute.Channel,
+		Template: normalizedRoute.Template,
+		Mode:     normalizedRoute.Mode,
+	}}, true)
 	if err != nil {
 		if isPermanentNotifyError(err) {
-			m.logger.Warn("drop queued notification due permanent error", "channel", channel, "alert_id", notification.AlertID, "error", err.Error())
-			return nil
+			m.logger.Warn("drop queued notification due permanent error", "channel", normalizedRoute.Channel, "alert_id", notification.AlertID, "error", err.Error())
+			return notifyqueue.MarkPermanent(err)
 		}
 		return err
 	}
 
-	m.captureOpeningTelegramMessageID(notification.AlertID, notification.State, results)
-	m.captureExternalRefs(notification.AlertID, results)
-	m.captureLastNotified(notification.AlertID, notification.Timestamp, results)
-	if notification.State == domain.AlertStateFiring {
-		if err := m.persistExternalRefs(ctx, notification.AlertID, results); err != nil {
-			return err
-		}
-	}
-	return nil
+	return m.applyDeliveryResults(ctx, notification, results)
 }
 
 // enqueueNotificationJobs publishes per-channel delivery jobs into async queue.
@@ -671,23 +687,25 @@ func (m *Manager) enqueueNotificationJobs(ctx context.Context, producer notifyqu
 	success := 0
 	var firstErr error
 	for _, route := range routes {
-		channel, templateName, ok := normalizeNotifyRoute(route)
+		normalizedRoute, ok := normalizedRouteFromRuntimeRoute(route)
 		if !ok {
 			continue
 		}
-		perChannel, ok := m.prepareNotificationForChannel(notification, channel)
+		perRoute, ok := m.prepareNotificationForRoute(notification, normalizedRoute)
 		if !ok {
 			continue
 		}
 		job := notifyqueue.Job{
-			ID:           notifyqueue.BuildJobID(channel, templateName, perChannel),
-			Channel:      channel,
-			Template:     templateName,
-			Notification: perChannel,
+			ID:           notifyqueue.BuildJobID(normalizedRoute.Channel, normalizedRoute.Template, perRoute),
+			RouteKey:     normalizedRoute.Key,
+			RouteMode:    normalizedRoute.Mode,
+			Channel:      normalizedRoute.Channel,
+			Template:     normalizedRoute.Template,
+			Notification: perRoute,
 			CreatedAt:    m.clock.Now(),
 		}
 		if err := producer.Enqueue(ctx, job); err != nil {
-			m.logger.Error("enqueue notification failed", "channel", channel, "alert_id", perChannel.AlertID, "error", err.Error())
+			m.logger.Error("enqueue notification failed", "channel", normalizedRoute.Channel, "route_key", normalizedRoute.Key, "alert_id", perRoute.AlertID, "error", err.Error())
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -701,57 +719,108 @@ func (m *Manager) enqueueNotificationJobs(ctx context.Context, producer notifyqu
 	return nil
 }
 
-// normalizeNotifyRoute normalizes route channel/template and validates they are non-empty.
+// normalizeNotifyRoute normalizes route fields and validates required values.
 // Params: raw route config.
-// Returns: normalized channel/template and validity flag.
-func normalizeNotifyRoute(route config.RuleNotifyRoute) (string, string, bool) {
+// Returns: normalized route descriptor and validity flag.
+func normalizeNotifyRoute(route config.RuleNotifyRoute) (normalizedNotifyRoute, bool) {
 	channel := strings.ToLower(strings.TrimSpace(route.Channel))
 	templateName := strings.TrimSpace(route.Template)
 	if channel == "" || templateName == "" {
-		return "", "", false
+		return normalizedNotifyRoute{}, false
 	}
-	return channel, templateName, true
+	routeKey := strings.ToLower(strings.TrimSpace(route.Name))
+	if routeKey == "" {
+		routeKey = channel
+	}
+	mode := config.NormalizeNotifyRouteMode(route.Mode)
+	return normalizedNotifyRoute{
+		Key:      routeKey,
+		Channel:  channel,
+		Template: templateName,
+		Mode:     mode,
+	}, true
 }
 
-// prepareNotificationForChannel enriches notification payload with channel-specific runtime metadata.
-// Params: base notification and destination channel.
-// Returns: channel-specific notification and send eligibility flag.
-func (m *Manager) prepareNotificationForChannel(notification domain.Notification, channel string) (domain.Notification, bool) {
-	perChannel := notification
-	perChannel.Channel = channel
-	if perChannel.Timestamp.IsZero() {
-		perChannel.Timestamp = m.clock.Now()
+// normalizedRouteFromRuntimeRoute converts already-normalized runtime route into descriptor.
+// Params: route config from in-memory normalized rule set.
+// Returns: route descriptor and validity flag for required fields.
+func normalizedRouteFromRuntimeRoute(route config.RuleNotifyRoute) (normalizedNotifyRoute, bool) {
+	if route.Channel == "" || route.Template == "" {
+		return normalizedNotifyRoute{}, false
 	}
-	if strings.TrimSpace(perChannel.ExternalRef) == "" {
-		if externalRef, exists := m.engine.GetChannelExternalRef(perChannel.AlertID, channel); exists {
-			perChannel.ExternalRef = externalRef
+	routeKey := route.Name
+	if routeKey == "" {
+		routeKey = route.Channel
+	}
+	mode := route.Mode
+	if mode == "" {
+		mode = config.NotifyRouteModeHistory
+	}
+	return normalizedNotifyRoute{
+		Key:      routeKey,
+		Channel:  route.Channel,
+		Template: route.Template,
+		Mode:     mode,
+	}, true
+}
+
+// prepareNotificationForRoute enriches notification payload with route-scoped runtime metadata.
+// Params: base notification and normalized destination route.
+// Returns: route-specific notification and send eligibility flag.
+func (m *Manager) prepareNotificationForRoute(notification domain.Notification, route normalizedNotifyRoute) (domain.Notification, bool) {
+	perRoute := notification
+	perRoute.Channel = route.Channel
+	perRoute.RouteKey = route.Key
+	perRoute.RouteMode = route.Mode
+	if perRoute.Timestamp.IsZero() {
+		perRoute.Timestamp = m.clock.Now()
+	}
+	if strings.TrimSpace(perRoute.ExternalRef) == "" {
+		if externalRef, exists := m.engine.GetChannelExternalRef(perRoute.AlertID, route.Key); exists {
+			perRoute.ExternalRef = externalRef
 		}
 	}
-	if perChannel.State == domain.AlertStateResolved &&
-		channel == config.NotifyChannelMattermost &&
-		strings.TrimSpace(perChannel.ExternalRef) == "" {
-		m.logger.Warn("skip mattermost resolved notification without firing reference", "channel", channel, "alert_id", perChannel.AlertID)
-		return domain.Notification{}, false
-	}
-	if perChannel.State == domain.AlertStateResolved && channel == config.NotifyChannelTelegram {
-		if openingMessageID, exists := m.engine.GetChannelMessageID(perChannel.AlertID, channel); exists {
-			perChannel.ReplyToMessageID = &openingMessageID
+
+	if perRoute.State == domain.AlertStateResolved {
+		switch route.Mode {
+		case config.NotifyRouteModeActiveOnly:
+			if strings.TrimSpace(perRoute.ExternalRef) == "" {
+				m.logger.Warn("skip active_only resolved notification without active reference", "channel", route.Channel, "route_key", route.Key, "alert_id", perRoute.AlertID)
+				return domain.Notification{}, false
+			}
+		default:
+			if route.Channel == config.NotifyChannelMattermost && strings.TrimSpace(perRoute.ExternalRef) == "" {
+				m.logger.Warn("skip mattermost resolved notification without firing reference", "channel", route.Channel, "route_key", route.Key, "alert_id", perRoute.AlertID)
+				return domain.Notification{}, false
+			}
+			if route.Channel == config.NotifyChannelTelegram {
+				if openingMessageID, exists := m.engine.GetChannelMessageID(perRoute.AlertID, route.Key); exists {
+					perRoute.ReplyToMessageID = &openingMessageID
+				}
+			}
 		}
 	}
-	return perChannel, true
+	return perRoute, true
 }
 
 // isPermanentNotifyError classifies delivery errors that should not be retried.
 // Params: dispatcher send error.
 // Returns: true when retry cannot recover (template/config mismatch).
 func isPermanentNotifyError(err error) bool {
-	if err == nil {
-		return false
+	return notify.IsPermanent(err)
+}
+
+// applyDeliveryResults persists channel delivery side effects after successful send.
+// Params: notification payload and per-route send results.
+// Returns: persistence error for external refs only.
+func (m *Manager) applyDeliveryResults(ctx context.Context, notification domain.Notification, results []routeSendResult) error {
+	m.captureOpeningTelegramMessageID(notification.AlertID, notification.State, results)
+	m.captureExternalRefs(notification.AlertID, results)
+	m.captureLastNotified(notification.AlertID, notification.Timestamp, results)
+	if notification.State == domain.AlertStateResolved {
+		return nil
 	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "notify template") && strings.Contains(message, "not configured") ||
-		strings.Contains(message, "notify template") && strings.Contains(message, "is invalid") ||
-		strings.Contains(message, "notify channel") && strings.Contains(message, "not configured")
+	return m.persistExternalRefs(ctx, notification.AlertID, results)
 }
 
 // ruleByName resolves one active rule by name under read lock.
@@ -767,34 +836,41 @@ func (m *Manager) ruleByName(name string) (config.RuleConfig, bool) {
 // captureOpeningTelegramMessageID stores first Telegram message id for alert lifecycle threading.
 // Params: alert id, notification state, and per-channel send results.
 // Returns: runtime state updated only for first active Telegram message.
-func (m *Manager) captureOpeningTelegramMessageID(alertID string, stateValue domain.AlertState, results map[string]notify.SendResult) {
+func (m *Manager) captureOpeningTelegramMessageID(alertID string, stateValue domain.AlertState, results []routeSendResult) {
 	if stateValue != domain.AlertStatePending && stateValue != domain.AlertStateFiring {
 		return
 	}
-	result, ok := results[config.NotifyChannelTelegram]
-	if !ok || result.MessageID <= 0 {
-		return
+	for _, entry := range results {
+		if entry.Route.Channel != config.NotifyChannelTelegram {
+			continue
+		}
+		if entry.Route.Mode == config.NotifyRouteModeActiveOnly {
+			continue
+		}
+		if entry.Result.MessageID <= 0 {
+			continue
+		}
+		_, exists := m.engine.GetChannelMessageID(alertID, entry.Route.Key)
+		if exists {
+			continue
+		}
+		m.engine.SetChannelMessageID(alertID, entry.Route.Key, entry.Result.MessageID)
 	}
-	_, exists := m.engine.GetChannelMessageID(alertID, config.NotifyChannelTelegram)
-	if exists {
-		return
-	}
-	m.engine.SetChannelMessageID(alertID, config.NotifyChannelTelegram, result.MessageID)
 }
 
 // captureExternalRefs stores external issue references from send results in runtime state.
 // Params: alert id and per-channel send results.
 // Returns: runtime external refs updated for channels that returned non-empty refs.
-func (m *Manager) captureExternalRefs(alertID string, results map[string]notify.SendResult) {
+func (m *Manager) captureExternalRefs(alertID string, results []routeSendResult) {
 	if len(results) == 0 {
 		return
 	}
-	for channel, result := range results {
-		externalRef := strings.TrimSpace(result.ExternalRef)
+	for _, entry := range results {
+		externalRef := strings.TrimSpace(entry.Result.ExternalRef)
 		if externalRef == "" {
 			continue
 		}
-		m.engine.SetChannelExternalRef(alertID, channel, externalRef)
+		m.engine.SetChannelExternalRef(alertID, entry.Route.Key, externalRef)
 	}
 }
 
@@ -817,17 +893,17 @@ func (m *Manager) seedExternalRefs(alertID string, refs map[string]string) {
 // persistExternalRefs stores external issue references in alert card for restart-safe resolve path.
 // Params: alert id and per-channel send results with external refs.
 // Returns: persistence error when card update fails.
-func (m *Manager) persistExternalRefs(ctx context.Context, alertID string, results map[string]notify.SendResult) error {
+func (m *Manager) persistExternalRefs(ctx context.Context, alertID string, results []routeSendResult) error {
 	if len(results) == 0 {
 		return nil
 	}
 	updates := make(map[string]string)
-	for channel, result := range results {
-		externalRef := strings.TrimSpace(result.ExternalRef)
+	for _, entry := range results {
+		externalRef := strings.TrimSpace(entry.Result.ExternalRef)
 		if externalRef == "" {
 			continue
 		}
-		updates[channel] = externalRef
+		updates[entry.Route.Key] = externalRef
 	}
 	if len(updates) == 0 {
 		return nil
@@ -846,11 +922,11 @@ func (m *Manager) persistExternalRefs(ctx context.Context, alertID string, resul
 		}
 
 		changed := false
-		for channel, externalRef := range updates {
-			if card.ExternalRefs[channel] == externalRef {
+		for routeKey, externalRef := range updates {
+			if card.ExternalRefs[routeKey] == externalRef {
 				continue
 			}
-			card.ExternalRefs[channel] = externalRef
+			card.ExternalRefs[routeKey] = externalRef
 			changed = true
 		}
 		if !changed {
@@ -871,13 +947,13 @@ func (m *Manager) persistExternalRefs(ctx context.Context, alertID string, resul
 // captureLastNotified stores notification timestamp for repeat scheduler keys.
 // Params: alert id, send time, and sent-channel results.
 // Returns: runtime state markers updated for delivered channels.
-func (m *Manager) captureLastNotified(alertID string, now time.Time, results map[string]notify.SendResult) {
+func (m *Manager) captureLastNotified(alertID string, now time.Time, results []routeSendResult) {
 	if len(results) == 0 {
 		return
 	}
 	repeatPerChannel := m.repeatPerChannel()
-	for channel := range results {
-		notifyKey := channel
+	for _, entry := range results {
+		notifyKey := entry.Route.Key
 		if !repeatPerChannel {
 			notifyKey = "global"
 		}
@@ -977,14 +1053,15 @@ func normalizeRule(rule config.RuleConfig) config.RuleConfig {
 	if len(rule.Notify.Route) > 0 {
 		normalizedRoutes := make([]config.RuleNotifyRoute, 0, len(rule.Notify.Route))
 		for _, route := range rule.Notify.Route {
-			channel := strings.ToLower(strings.TrimSpace(route.Channel))
-			templateName := strings.TrimSpace(route.Template)
-			if channel == "" || templateName == "" {
+			normalizedRoute, ok := normalizeNotifyRoute(route)
+			if !ok {
 				continue
 			}
 			normalizedRoutes = append(normalizedRoutes, config.RuleNotifyRoute{
-				Channel:  channel,
-				Template: templateName,
+				Name:     normalizedRoute.Key,
+				Channel:  normalizedRoute.Channel,
+				Template: normalizedRoute.Template,
+				Mode:     normalizedRoute.Mode,
 			})
 		}
 		rule.Notify.Route = normalizedRoutes

@@ -1,9 +1,7 @@
 package e2e
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -13,16 +11,33 @@ import (
 )
 
 func TestServiceSmokeHealthReadyAndIngest(t *testing.T) {
-	port, err := freePort()
-	if err != nil {
-		t.Fatalf("free port: %v", err)
-	}
-	natsURL, stopNATS := startLocalNATSServer(t)
-	defer stopNATS()
+	for _, metric := range allE2EMetricCases() {
+		metric := metric
+		t.Run(metric.Name, func(t *testing.T) {
+			port, err := freePort()
+			if err != nil {
+				t.Fatalf("free port: %v", err)
+			}
+			natsURL, stopNATS := startLocalNATSServer(t)
+			defer stopNATS()
 
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.toml")
-	cfg := fmt.Sprintf(`
+			ruleName := "smoke_" + metric.Name
+			options := defaultE2ERuleOptions(metric)
+			switch metric.AlertType {
+			case "count_total":
+				options.RaiseN = 100
+				options.ResolveSilenceSec = 5
+			case "count_window":
+				options.RaiseN = 100
+				options.WindowSec = 60
+				options.ResolveSilenceSec = 5
+			default:
+				options.MissingSec = 3600
+			}
+
+			tmpDir := t.TempDir()
+			configPath := filepath.Join(tmpDir, "config.toml")
+			cfg := fmt.Sprintf(`
 [service]
 name = "alerting"
 reload_enabled = false
@@ -72,62 +87,39 @@ log_each_attempt = true
 [[notify.http.name-template]]
 name = "http_default"
 message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"], service = ["api"] }
-
-[rule.ct.key]
-from_tags = ["dc", "service"]
-
-[rule.ct.raise]
-n = 100
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
+`, port, natsURL)
+			cfg += buildRuleTOML(ruleName, metric, e2eMetricVar, options, fmt.Sprintf(`
+[[rule.%[1]s.notify.route]]
 channel = "http"
 template = "http_default"
-`, port, natsURL)
+`, ruleName))
 
-	if err := os.WriteFile(configPath, []byte(cfg), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
+			if err := os.WriteFile(configPath, []byte(cfg), 0o644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			service := newServiceFromConfig(t, configPath)
+			cancel, done := runService(t, service)
+			defer cancel()
+
+			baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+			waitReady(t, port)
+
+			resp, err := http.Get(baseURL + "/healthz")
+			if err != nil {
+				t.Fatalf("health request: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("expected health 200, got %d", resp.StatusCode)
+			}
+			_ = resp.Body.Close()
+
+			postMetricEvent(t, baseURL, e2eMetricVar, "smoke-h1")
+
+			cancel()
+			waitServiceStop(t, done)
+		})
 	}
-
-	service := newServiceFromConfig(t, configPath)
-	cancel, done := runService(t, service)
-	defer cancel()
-
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	waitReady(t, port)
-
-	resp, err := http.Get(baseURL + "/healthz")
-	if err != nil {
-		t.Fatalf("health request: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected health 200, got %d", resp.StatusCode)
-	}
-	_ = resp.Body.Close()
-
-	eventJSON := []byte(`{"dt":1739876543210,"type":"event","tags":{"dc":"dc1","service":"api"},"var":"errors","value":{"t":"n","n":1},"agg_cnt":1,"win":0}`)
-	resp, err = http.Post(baseURL+"/ingest", "application/json", bytes.NewReader(eventJSON))
-	if err != nil {
-		t.Fatalf("ingest request: %v", err)
-	}
-	_, _ = io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected ingest 202, got %d", resp.StatusCode)
-	}
-
-	cancel()
-	waitServiceStop(t, done)
 }
 
 func freePort() (int, error) {
