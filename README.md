@@ -38,7 +38,16 @@
 - нагрузка multi-instance: `200 000 events/sec`.
 - доступность multi-instance: 99.99%
 
-Подтвержденная нагрузка single-instance vCPU:1; RAM:128MB (5m benchmark, `BenchmarkIngestThroughput`): `~45 473 events/sec`.
+Подтвержденная нагрузка single-instance (последний замер, `go test ./test/e2e -run '^$' -bench ... -benchtime=15s -count=1`):
+
+| Входной канал | Тип метрики | Обработка, событий/сек |
+|---|---|---:|
+| HTTP | `count_total` | `2 041 965` |
+| HTTP | `count_window` | `1 309 239` |
+| HTTP | `missing_heartbeat` | `1 923 133` |
+| NATS | `count_total` | `154 609` |
+| NATS | `count_window` | `156 339` |
+| NATS | `missing_heartbeat` | `154 588` |
 
 ### Основной сценарий использования 
 Агрегаты метрик формируются в ClickHouse и через mat.view nats engine передаются в nats. Алертинг по подписке принимает все агрегаты и по своим правилам взводит или гасит алерт. 
