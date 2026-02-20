@@ -10,19 +10,19 @@
 
 ## Принципиальная схема
 ```    
-      [ jira ] [ youtrack ] [ muttermost ] [ telegram ]
-         |__________|_____________|___________|
-                              ▲
-                        ______|_______
-                        ▲            ▲
-                        |            |
-                     mALERT-1 … mALERT-N 
-                        ▲            ▲
-                        |            |
-    [ClickHouse]  ──►  nats     http_server 
-      ▲       ▲         ▲            ▲
-      |       |         |            |
-    serv3   serv4    servnN       servnN+1
+                   [ jira ] [ youtrack ] [ muttermost ] [ telegram ]
+                       |__________|_____________|___________|
+                                          ▲
+                                    ______|_______
+                                    ▲            ▲
+                                    |            |
+                                mALERT-1 … mALERT-N 
+                                    ▲            ▲
+                                    |            |
+[ vector ] ──►  [ClickHouse]  ──►  nats     http_server 
+    ▲                ▲              ▲            ▲
+    |                |              |            |
+[ mAGENT ]      [ serv3 ]         servnN      servnN+1
  ```
 
 ### Входящие интерфейсы
