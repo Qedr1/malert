@@ -1,0 +1,84 @@
+# ------------------------------------------------------------
+# ALERTING: КОНФИГ КАНАЛА ДОСТАВКИ YOUTRACK (TRACKER)
+# Канал работает как transport в общем notify pipeline:
+# - state=firing  -> create issue
+# - state=resolved -> apply resolve command
+# ------------------------------------------------------------
+
+[notify.youtrack]
+# Включить/выключить канал YouTrack.
+enabled = false
+# Базовый URL YouTrack.
+# Пример: "https://youtrack.example.com"
+base_url = "https://youtrack.example.com"
+# Таймаут HTTP запросов к YouTrack (сек).
+timeout_sec = 10
+
+[notify.youtrack.auth]
+# Для YouTrack обычно bearer/token header.
+# Варианты: none|basic|bearer|header.
+type = "bearer"
+# Токен доступа (пермишн-токен YouTrack).
+token = "perm:youtrack-token"
+# Префикс для Authorization header (обычно Bearer).
+prefix = "Bearer"
+# Для header type (если нужен нестандартный заголовок):
+header = ""
+username = ""
+password = ""
+
+[notify.youtrack.retry]
+# Политика ретраев YouTrack транспорта.
+enabled = true
+backoff = "exponential"
+initial_ms = 500
+max_ms = 60000
+# 0 = бесконечно.
+max_attempts = 0
+log_each_attempt = true
+
+[notify.youtrack.create]
+# HTTP действие открытия задачи (firing).
+method = "POST"
+# fields ограничивает ответ только нужными полями.
+path = "/api/issues?fields=id,idReadable"
+headers = { Accept = "application/json", Content-Type = "application/json" }
+# Шаблон JSON body для create issue.
+body_template = '''
+{
+  "project": { "id": "0-0" },
+  "summary": {{ json .Message }},
+  "description": {{ json .AlertID }}
+}
+'''
+# Успешные HTTP коды для create.
+success_status = [200, 201]
+# Предпочтительно хранить idReadable для удобства чтения.
+ref_json_path = "idReadable"
+
+[notify.youtrack.resolve]
+# HTTP действие закрытия задачи (resolved) через команду.
+method = "POST"
+# В official API команда применяется через /api/commands,
+# а целевая задача передается в body (`issues`).
+path = "/api/commands"
+headers = { Accept = "application/json", Content-Type = "application/json" }
+# query задайте под вашу схему состояний (например "Fixed", "Done", "Resolved").
+body_template = '''
+{
+  "query": "Fixed",
+  "issues": [
+    { "idReadable": {{ json .ExternalRef }} }
+  ],
+  "silent": true
+}
+'''
+# Успешные HTTP коды для resolve-команды.
+success_status = [200]
+
+[[notify.youtrack.name-template]]
+# Именованный шаблон общего сообщения для YouTrack канала.
+# На него ссылается правило: [[rule.<rule_name>.notify.route]] channel="youtrack", template="yt_default".
+name = "yt_default"
+# Сообщение, которое рендерится в notify pipeline и может использоваться в body_template.
+message = "{{ .RuleName }} | {{ .State }} | {{ .Var }}={{ .MetricValue }} | id={{ .ShortID }}"

@@ -1,0 +1,44 @@
+# ------------------------------------------------------------
+# ALERTING: ПРАВИЛА ТИПА missing_heartbeat
+# Формат правил: [rule.<rule_name>] + вложенные секции
+# Кратко:
+# - Отслеживает отсутствие heartbeat-событий после первого принятого события.
+# - Поднятие (firing): если heartbeat не приходил raise.missing_sec секунд.
+# - Опускание (resolved): при первом новом heartbeat-событии,
+#   прошедшем match-фильтры.
+# ------------------------------------------------------------
+
+[rule.hb_telegram_live]
+# Тип правила:
+# - missing_heartbeat: взводит алерт при отсутствии heartbeat после первого события.
+# Тип алгоритма: missing_heartbeat.
+alert_type = "missing_heartbeat"
+
+[rule.hb_telegram_live.match]
+# Какие типы входящих событий считаем heartbeat-сигналом.
+type = ["event", "agg"]
+# Список var, которые считаются heartbeat для этого правила.
+var = ["heartbeat"]
+# Allow-only фильтр тегов.
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.hb_telegram_live.key]
+# Список тегов, участвующих в построении детерминированного alert_id.
+from_tags = ["dc", "service", "host"]
+
+[rule.hb_telegram_live.raise]
+# Взведение: если heartbeat не поступал missing_sec секунд -> firing.
+# Если heartbeat не приходил missing_sec секунд -> firing.
+missing_sec = 60
+
+[rule.hb_telegram_live.pending]
+# Включает стадию pending перед firing.
+enabled = false
+# Сколько секунд условие должно удерживаться в pending до firing.
+delay_sec = 300
+
+[[rule.hb_telegram_live.notify.route]]
+# Канал доставки для уведомлений этого правила.
+channel = "telegram"
+# Имя шаблона в transport-конфиге канала.
+template = "tg_default"

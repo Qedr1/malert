@@ -1,0 +1,128 @@
+# ------------------------------------------------------------
+# ALERTING: БАЗОВЫЙ ГЛОБАЛЬНЫЙ КОНФИГ СЕРВИСА
+# Загружается вместе с остальными файлами из каталога:
+#   go run ./cmd/alerting --config-dir ./configs/alerts
+# В этом файле только общесервисные параметры.
+# ------------------------------------------------------------
+
+[service]
+# Логическое имя процесса (для логов/диагностики).
+name = "alerting"
+# Включает периодический hot reload конфигов.
+reload_enabled = true
+# Интервал проверки изменений конфигов (сек).
+reload_interval_sec = 3
+# Интервал одного шага фонового цикла обработки таймерных переходов.
+# Интервал фонового тика движка алертов (сек).
+# Используется для resolve/repeat/timer-driven логики.
+resolve_scan_interval_sec = 1
+
+[log.console]
+# Включить вывод логов в stdout/stderr.
+enabled = true
+# Уровень логирования: debug|info|warn|error|panic.
+level = "info"
+# Формат для консоли:
+# - line: человекочитаемый короткий формат
+# - json: структурированные логи
+# Формат вывода: line|json.
+format = "line"
+
+[log.file]
+# Включить запись логов в файл.
+enabled = true
+# Уровень логирования: debug|info|warn|error|panic.
+level = "info"
+# Формат для файла:
+# - line: текстовый
+# - json: удобный для парсеров/агентов сбора
+# Формат вывода: line|json.
+format = "line"
+# Путь к файлу логов (создается автоматически при запуске).
+path = "./alerting.log"
+
+[ingest.http]
+# Включить прием событий по HTTP.
+enabled = true
+# HTTP bind-адрес сервиса (хост:порт).
+listen = "127.0.0.1:8080"
+# Health endpoint: жив ли процесс.
+health_path = "/healthz"
+# Ready endpoint: готов ли сервис принимать трафик.
+ready_path = "/readyz"
+# HTTP endpoint входящих событий.
+ingest_path = "/ingest"
+# Жесткий лимит размера тела POST /ingest.
+# Максимальный размер тела запроса (байт).
+max_body_bytes = 1048576
+
+[ingest.nats]
+# В этом профиле NATS ingest отключен.
+# Если включить, нужно дополнительно задать URL/subject.
+enabled = false
+# Список URL NATS/JetStream (драйвер поддерживает несколько адресов).
+# Этот же список используется и для state backend (отдельной state-секции нет).
+url = ["nats://127.0.0.1:4222"]
+# Subject, куда внешние сервисы публикуют входящие события.
+subject = "alerting.events"
+# Stream JetStream, к которому привязан subject очереди.
+stream = "ALERTING_EVENTS"
+# Durable имя ingest consumer (общее для всех инстансов alerting в группе).
+consumer_name = "alerting-ingest"
+# Deliver group ingest consumer: инстансы делят сообщения очереди.
+deliver_group = "alerting-workers"
+# Ack timeout (сек): если не ack вовремя, сообщение будет redelivered.
+ack_wait_sec = 30
+# Задержка перед NAK redelivery (мс) при ошибке обработки.
+nack_delay_ms = 1000
+# Максимум попыток доставки сообщения:
+# -1 = бесконечно, >0 = конечный лимит.
+# Лимит redelivery:
+# -1 = бесконечно, >0 = конечное число доставок.
+max_deliver = -1
+# Максимум unacked сообщений у consumer.
+max_ack_pending = 4096
+
+[notify]
+# Глобальные правила повторных уведомлений.
+# Детали конкретного транспорта задаются в transport-файлах.
+
+# Включить повторы уведомлений.
+repeat = true
+# Интервал повтора (сек).
+repeat_every_sec = 300
+# В каких состояниях повторять.
+# В MVP обычно повторяем только firing.
+repeat_on = ["firing"]
+# Режим ключа повтора:
+# - true: отдельно по каждому каналу доставки
+# - false: общий счетчик повторов на alert_id
+# true: таймеры повторов считаются отдельно по каждому каналу.
+# false: общий repeat-таймер на alert.
+repeat_per_channel = true
+# Отправлять ли уведомление при входе в pending.
+on_pending = false
+
+[notify.queue]
+# Асинхронная очередь доставки уведомлений (отдельно от ingest path).
+# Если включено, manager только публикует jobs, а отправка по каналам идет worker-ом.
+enabled = true
+# URL NATS/JetStream для очереди доставки.
+url = "nats://127.0.0.1:4222"
+# Subject jobs доставки.
+subject = "alerting.notify.jobs"
+# Stream JetStream для subject очереди доставки.
+stream = "ALERTING_NOTIFY"
+# Durable имя worker consumer.
+consumer_name = "alerting-notify"
+# Deliver group worker consumer: инстансы делят jobs доставки.
+deliver_group = "alerting-notify-workers"
+# Ack timeout (сек): если worker не ack вовремя, job будет redelivered.
+ack_wait_sec = 30
+# Задержка перед NAK redelivery (мс) при ошибке отправки.
+nack_delay_ms = 1000
+# Максимум попыток доставки job:
+# -1 = бесконечно, >0 = конечный лимит.
+max_deliver = -1
+# Максимум unacked jobs у consumer.
+max_ack_pending = 4096

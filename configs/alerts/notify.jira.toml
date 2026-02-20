@@ -1,0 +1,104 @@
+# ------------------------------------------------------------
+# ALERTING: КОНФИГ КАНАЛА ДОСТАВКИ JIRA (TRACKER)
+# Канал работает как transport в общем notify pipeline:
+# - state=firing  -> create issue
+# - state=resolved -> close/transition issue
+# ------------------------------------------------------------
+
+[notify.jira]
+# Включить/выключить канал Jira.
+enabled = false
+# Базовый URL Jira (Cloud или self-hosted).
+# Пример: "https://company.atlassian.net"
+base_url = "https://jira.example.com"
+# Таймаут HTTP запросов к Jira (сек).
+timeout_sec = 10
+
+[notify.jira.auth]
+# Тип аутентификации:
+# - none
+# - basic  (username + password/api_token)
+# - bearer (token, header Authorization)
+# - header (произвольный header + token)
+type = "basic"
+# Для basic:
+username = "jira-user@example.com"
+# Пароль или API token (для Jira Cloud обычно API token).
+password = "jira-api-token"
+# Для bearer/header:
+token = ""
+# Для header:
+header = ""
+# Необязательный префикс для bearer/header (например "Bearer").
+prefix = ""
+
+[notify.jira.retry]
+# Политика ретраев Jira транспорта.
+enabled = true
+backoff = "exponential"
+initial_ms = 500
+max_ms = 60000
+# 0 = бесконечно.
+max_attempts = 0
+log_each_attempt = true
+
+[notify.jira.create]
+# HTTP действие открытия задачи (firing).
+method = "POST"
+# Относительный path к base_url для create-запроса.
+path = "/rest/api/3/issue"
+# Доп. заголовки запроса (значения поддерживают Go template).
+headers = { Accept = "application/json", Content-Type = "application/json" }
+# Шаблон тела create запроса.
+# Доступные поля: .AlertID .RuleName .State .Message .Var .MetricValue .StartedAt .Duration .Tags ...
+# Вспомогательные функции: json, fmtDuration.
+body_template = '''
+{
+  "fields": {
+    "project": { "key": "OPS" },
+    "summary": {{ json .Message }},
+    "issuetype": { "name": "Task" },
+    "description": {
+      "type": "doc",
+      "version": 1,
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            { "type": "text", "text": {{ json .RuleName }} },
+            { "type": "text", "text": " | " },
+            { "type": "text", "text": {{ json .AlertID }} }
+          ]
+        }
+      ]
+    }
+  }
+}
+'''
+# Какие HTTP коды считать успешными.
+success_status = [200, 201]
+# Где взять внешний ID задачи из JSON ответа.
+# Пример для Jira: "key" (например OPS-123).
+ref_json_path = "key"
+
+[notify.jira.resolve]
+# HTTP действие закрытия/transition (resolved).
+method = "POST"
+# В path используется .ExternalRef (полученный на create и сохраненный в KV).
+path = "/rest/api/3/issue/{{ .ExternalRef }}/transitions"
+headers = { Accept = "application/json", Content-Type = "application/json" }
+# В transition.id подставьте ваш workflow transition id.
+body_template = '''
+{
+  "transition": { "id": "31" }
+}
+'''
+# Успешные коды для transition/resolve запроса.
+success_status = [200, 204]
+
+[[notify.jira.name-template]]
+# Именованный шаблон общего сообщения для Jira канала.
+# На него ссылается правило: [[rule.<rule_name>.notify.route]] channel="jira", template="jira_default".
+name = "jira_default"
+# Сообщение, которое рендерится в notify pipeline и может использоваться в body_template.
+message = "{{ .RuleName }} | {{ .State }} | {{ .Var }}={{ .MetricValue }} | id={{ .ShortID }}"

@@ -1,0 +1,177 @@
+package e2e
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"alerting/internal/domain"
+
+	"github.com/nats-io/nats.go"
+)
+
+func TestMultiServiceNATSQueueLifecycleSingleNotifications(t *testing.T) {
+	natsURL, stopNATS := startLocalNATSServer(t)
+	defer stopNATS()
+
+	ensureEventStream(t, natsURL, e2eEventsStream, e2eEventsSubj)
+	ensureStateBuckets(t, natsURL, e2eTickBucket, e2eDataBucket)
+
+	collector := &notificationCollector{}
+	webhook := httptest.NewServer(http.HandlerFunc(collector.Handle))
+	defer webhook.Close()
+
+	portA, err := freePort()
+	if err != nil {
+		t.Fatalf("free port A: %v", err)
+	}
+	portB, err := freePort()
+	if err != nil {
+		t.Fatalf("free port B: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	cfgAPath := filepath.Join(tmpDir, "svc-a.toml")
+	cfgBPath := filepath.Join(tmpDir, "svc-b.toml")
+	if err := os.WriteFile(cfgAPath, []byte(multiserviceNATSConfigTOML(portA, webhook.URL, natsURL, "svc-a")), 0o644); err != nil {
+		t.Fatalf("write config A: %v", err)
+	}
+	if err := os.WriteFile(cfgBPath, []byte(multiserviceNATSConfigTOML(portB, webhook.URL, natsURL, "svc-b")), 0o644); err != nil {
+		t.Fatalf("write config B: %v", err)
+	}
+
+	serviceA := newServiceFromConfig(t, cfgAPath)
+	serviceB := newServiceFromConfig(t, cfgBPath)
+
+	cancelA, doneA := runService(t, serviceA)
+	defer cancelA()
+	cancelB, doneB := runService(t, serviceB)
+	defer cancelB()
+
+	waitReady(t, portA)
+	waitReady(t, portB)
+
+	if err := publishNATSEvent(natsURL, e2eEventsSubj, `{"dt":1739876543210,"type":"event","tags":{"dc":"dc1","service":"api","host":"h1"},"var":"errors","value":{"t":"n","n":1},"agg_cnt":1,"win":0}`); err != nil {
+		t.Fatalf("publish nats event: %v", err)
+	}
+
+	waitFor(t, 8*time.Second, func() bool {
+		return collector.Count("ct_nats_multi", domain.AlertStateFiring) >= 1
+	})
+	waitFor(t, 12*time.Second, func() bool {
+		return collector.Count("ct_nats_multi", domain.AlertStateResolved) >= 1
+	})
+
+	time.Sleep(1200 * time.Millisecond)
+	if firing := collector.Count("ct_nats_multi", domain.AlertStateFiring); firing != 1 {
+		t.Fatalf("expected single firing notification, got %d", firing)
+	}
+	if resolved := collector.Count("ct_nats_multi", domain.AlertStateResolved); resolved != 1 {
+		t.Fatalf("expected single resolved notification, got %d", resolved)
+	}
+	if total := collector.Total(); total != 2 {
+		t.Fatalf("expected exactly 2 notifications total, got %d", total)
+	}
+
+	cancelA()
+	cancelB()
+	waitServiceStop(t, doneA)
+	waitServiceStop(t, doneB)
+}
+
+func publishNATSEvent(url, subject, body string) error {
+	nc, err := nats.Connect(url)
+	if err != nil {
+		return err
+	}
+	defer nc.Close()
+	if err := nc.Publish(subject, []byte(body)); err != nil {
+		return err
+	}
+	return nc.FlushTimeout(3 * time.Second)
+}
+
+func multiserviceNATSConfigTOML(port int, webhookURL, natsURL, serviceName string) string {
+	return fmt.Sprintf(`
+[service]
+name = "%s"
+reload_enabled = false
+resolve_scan_interval_sec = 1
+
+[log.console]
+enabled = true
+level = "error"
+format = "line"
+
+[ingest.http]
+enabled = false
+listen = "127.0.0.1:%d"
+health_path = "/healthz"
+ready_path = "/readyz"
+ingest_path = "/ingest"
+
+[ingest.nats]
+enabled = true
+url = ["%s"]
+subject = "%s"
+stream = "%s"
+consumer_name = "alerting-ingest-e2e"
+deliver_group = "alerting-workers-e2e"
+ack_wait_sec = 10
+nack_delay_ms = 100
+max_deliver = -1
+max_ack_pending = 4096
+
+[notify]
+repeat = false
+repeat_every_sec = 300
+repeat_on = ["firing"]
+repeat_per_channel = true
+on_pending = false
+
+[notify.http]
+enabled = true
+url = "%s"
+method = "POST"
+timeout_sec = 2
+
+[notify.http.retry]
+enabled = false
+
+[notify.telegram]
+enabled = false
+
+[[notify.http.name-template]]
+name = "http_default"
+message = "[{{ .RuleName }}] {{ .Message }} state={{ .State }}"
+
+[rule.ct_nats_multi]
+alert_type = "count_total"
+
+[rule.ct_nats_multi.match]
+type = ["event"]
+var = ["errors"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.ct_nats_multi.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.ct_nats_multi.raise]
+n = 1
+
+[rule.ct_nats_multi.resolve]
+silence_sec = 2
+
+[rule.ct_nats_multi.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.ct_nats_multi.notify.route]]
+channel = "http"
+template = "http_default"
+`, serviceName, port, natsURL, e2eEventsSubj, e2eEventsStream, webhookURL)
+}

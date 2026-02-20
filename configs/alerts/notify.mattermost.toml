@@ -1,0 +1,59 @@
+# ------------------------------------------------------------
+# ALERTING: КОНФИГ КАНАЛА ДОСТАВКИ MATTERMOST
+# Здесь только transport-специфичные параметры mattermost.
+# Канал работает через Mattermost REST API /api/v4/posts.
+# ------------------------------------------------------------
+
+[notify.mattermost]
+# Включить/выключить канал Mattermost.
+enabled = false
+# Базовый URL Mattermost.
+# Пример: https://mattermost.example
+base_url = "https://mattermost.example"
+# Токен бота Mattermost (секрет), используется в Authorization: Bearer <token>.
+bot_token = "replace-me"
+# ID канала Mattermost, куда публиковать сообщения.
+channel_id = "replace-me"
+# Таймаут HTTP-запроса к Mattermost API (сек).
+timeout_sec = 10
+
+[notify.mattermost.retry]
+# Политика ретраев именно для Mattermost транспорта.
+
+# Включить ретраи при ошибке отправки.
+enabled = true
+# Алгоритм паузы между попытками.
+# Поддержано: exponential (рост задержки до max_ms).
+backoff = "exponential"
+# Начальная задержка ретрая (мс).
+initial_ms = 500
+# Максимальная задержка ретрая (мс).
+max_ms = 60000
+# Максимум попыток.
+# 0 = бесконечно (до успешной отправки или остановки сервиса).
+max_attempts = 0
+# Логировать каждую неуспешную попытку отправки.
+log_each_attempt = true
+
+[[notify.mattermost.name-template]]
+# Именованный шаблон текста для канала Mattermost.
+# На него ссылаются правила в [[rule.<rule_name>.notify.route]].template.
+name = "mm_default"
+# Тело сообщения (Go text/template, missingkey=error).
+# Доступные поля: .RuleName .State .Var .MetricValue .StartedAt .Duration .ShortID ...
+message = '''
+{{- if eq .State "firing" -}}
+☝️ {{ .RuleName }} ({{ .ShortID }})
+{{ .Var }}: {{ .MetricValue }}
+Начало: {{ .StartedAt.Format "15:04" }}
+{{- else if eq .State "resolved" -}}
+👍 {{ .RuleName }} ({{ .ShortID }})
+{{ .Var }}: {{ .MetricValue }} (OK)
+Начало: {{ .StartedAt.Format "15:04" }}
+Дельта: {{ fmtDuration .Duration }}
+{{- end -}}
+'''
+
+# Логика threading:
+# - firing создает post и его post.id сохраняется как ссылка канала.
+# - resolved публикуется с root_id=<post.id firing> в тот же thread.

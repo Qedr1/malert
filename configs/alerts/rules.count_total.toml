@@ -1,0 +1,52 @@
+# ------------------------------------------------------------
+# ALERTING: ПРАВИЛА ТИПА count_total
+# Формат правил: [rule.<rule_name>] + вложенные секции
+# Кратко:
+# - Считает суммарное число событий (agg_cnt) без временного окна.
+# - Поднятие (firing): когда накопленный счетчик >= raise.n.
+# - Опускание (resolved): когда новых событий нет resolve.silence_sec секунд.
+# ------------------------------------------------------------
+
+[rule.ct_telegram_live]
+# Тип правила:
+# - count_total: суммирует количество входящих событий (agg_cnt) без окна.
+# Тип алгоритма: накопительный count_total.
+alert_type = "count_total"
+
+[rule.ct_telegram_live.match]
+# Какие типы входящих событий учитывает правило.
+# Принимаем только event для var=errors.
+type = ["event"]
+# Список var, попадающих под это правило.
+var = ["errors"]
+# Allow-only фильтр тегов.
+# Для каждого указанного тега значение должно входить в allow-список.
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.ct_telegram_live.key]
+# Список тегов, участвующих в построении детерминированного alert_id.
+# Участвует в построении alert_id.
+from_tags = ["dc", "service", "host"]
+
+[rule.ct_telegram_live.raise]
+# Порог взведения: firing при накопленном count >= n.
+# Алерт взводится при первом событии.
+n = 1
+
+[rule.ct_telegram_live.resolve]
+# Порог гашения: если новых событий нет silence_sec секунд -> resolved.
+# Гасим алерт после тишины 60 секунд.
+silence_sec = 60
+
+[rule.ct_telegram_live.pending]
+# Включает стадию pending перед firing.
+# Без pending: сразу firing.
+enabled = false
+# Сколько секунд условие должно удерживаться в pending до firing.
+delay_sec = 300
+
+[[rule.ct_telegram_live.notify.route]]
+# Канал доставки для уведомлений этого правила.
+channel = "telegram"
+# Имя шаблона в transport-конфиге канала.
+template = "tg_default"
