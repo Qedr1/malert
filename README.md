@@ -39,8 +39,9 @@
 - доступность multi-instance: 99.99%
 
 ##  Фактическая  нагрузка
-vCPU: 1
-RAM: 256MB
+- single-instance
+- vCPU: 1
+- RAM: 256MB
 ### HTTP 
 Входящих событий/сек
 | Тип метрики | batch=1  | batch=100 | batch=1000 |
