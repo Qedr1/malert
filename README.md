@@ -38,16 +38,24 @@
 - нагрузка multi-instance: `200 000 events/sec`.
 - доступность multi-instance: 99.99%
 
-Подтвержденная нагрузка single-instance (последний замер, `go test ./test/e2e -run '^$' -bench ... -benchtime=15s -count=1`):
+##  Фактическая  нагрузка
+vCPU: 1
+RAM: 256MB
+### HTTP 
+Входящих событий/сек
+| Тип метрики | batch=1  | batch=100 | batch=1000 |
+|---|---:|---:|---:|
+| count_total | 13 511 | 262 263 | 381 104 |
+| count_window | 15 354 | 251 465 | 366 217 |
+| missing_heartbeat | 13 446 | 250 208 | 367 137 |
 
-| Входной канал | Тип метрики | Обработка, событий/сек |
-|---|---|---:|
-| HTTP | `count_total` | `2 041 965` |
-| HTTP | `count_window` | `1 309 239` |
-| HTTP | `missing_heartbeat` | `1 923 133` |
-| NATS | `count_total` | `154 609` |
-| NATS | `count_window` | `156 339` |
-| NATS | `missing_heartbeat` | `154 588` |
+### NATS 
+Входящих событий/сек
+| Тип метрики | batch=1 | batch=100 | batch=1000 |
+|---|---:|---:|---:|
+| count_total | 172 566 |  174 606 | 167 814 |
+| count_window | 170 106 | 171 089 | 165 922 |
+| missing_heartbeat | 172 377 | 175 673 | 171 913 |
 
 ### Основной сценарий использования 
 Агрегаты метрик формируются в ClickHouse и через mat.view nats engine передаются в nats. Алертинг по подписке принимает все агрегаты и по своим правилам взводит или гасит алерт. 
