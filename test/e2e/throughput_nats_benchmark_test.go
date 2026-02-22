@@ -31,9 +31,23 @@ func (sink *countingSink) Push(event domain.Event) error {
 	return nil
 }
 
+func (sink *countingSink) PushBatch(events []domain.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	if err := sink.manager.PushBatch(events); err != nil {
+		return err
+	}
+	sink.count.Add(int64(len(events)))
+	return nil
+}
+
 // BenchmarkNATSQueueIngestThroughput measures queue path throughput:
 // producer -> NATS stream -> JetStream queue consumer -> manager pipeline.
 func BenchmarkNATSQueueIngestThroughput(b *testing.B) {
+	batchSize := benchmarkBatchSizeFromEnv("E2E_NATS_BATCH_SIZE", 1)
+	flushEveryBatch := batchSize > 1
+
 	for _, metric := range allE2EMetricCases() {
 		metric := metric
 		b.Run(metric.Name, func(b *testing.B) {
@@ -109,43 +123,42 @@ func BenchmarkNATSQueueIngestThroughput(b *testing.B) {
 			b.ResetTimer()
 			startedAt := time.Now()
 			for i := 0; i < b.N; i++ {
-				if err := nc.Publish(e2eEventsSubj, eventJSON); err != nil {
-					b.Fatalf("publish event %d: %v", i, err)
+				for j := 0; j < batchSize; j++ {
+					if err := nc.Publish(e2eEventsSubj, eventJSON); err != nil {
+						b.Fatalf("publish event batch=%d item=%d: %v", i, j, err)
+					}
+				}
+				if flushEveryBatch {
+					if err := nc.FlushTimeout(10 * time.Second); err != nil {
+						b.Fatalf("publisher flush batch=%d: %v", i, err)
+					}
 				}
 			}
-			if err := nc.FlushTimeout(10 * time.Second); err != nil {
-				b.Fatalf("publisher flush: %v", err)
+			if !flushEveryBatch {
+				if err := nc.FlushTimeout(10 * time.Second); err != nil {
+					b.Fatalf("publisher flush: %v", err)
+				}
 			}
 
-			deadline := time.Now().Add(45 * time.Second)
-			lastCount := sink.count.Load()
-			lastProgressAt := time.Now()
-			for {
-				current := sink.count.Load()
-				if current >= int64(b.N) {
-					break
-				}
-				if current > lastCount {
-					lastCount = current
-					lastProgressAt = time.Now()
-				}
-				if time.Now().After(deadline) || time.Since(lastProgressAt) > 2*time.Second {
-					break
+			expected := int64(b.N * batchSize)
+			deadline := time.Now().Add(5 * time.Minute)
+			for sink.count.Load() < expected {
+				if time.Now().After(deadline) {
+					b.Fatalf("queue path timeout: processed=%d sent=%d", sink.count.Load(), expected)
 				}
 				time.Sleep(2 * time.Millisecond)
 			}
 
 			processed := sink.count.Load()
-			if processed == 0 {
-				b.Fatalf("queue path did not process any events")
-			}
 			elapsed := time.Since(startedAt)
 			eventsPerSecond := float64(processed) / elapsed.Seconds()
-			backlog := int64(b.N) - processed
+			requestsPerSecond := float64(b.N) / elapsed.Seconds()
+			backlog := expected - processed
 			if backlog < 0 {
 				backlog = 0
 			}
 			b.ReportMetric(eventsPerSecond, "events/sec")
+			b.ReportMetric(requestsPerSecond, "req/sec")
 			b.ReportMetric(float64(processed), "processed_events")
 			b.ReportMetric(float64(backlog), "backlog_events")
 		})

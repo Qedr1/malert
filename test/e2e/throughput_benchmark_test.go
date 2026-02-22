@@ -1,21 +1,27 @@
 package e2e
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"alerting/internal/app"
 	"alerting/internal/clock"
 	"alerting/internal/config"
-	"alerting/internal/domain"
+	"alerting/internal/ingest"
 	"alerting/internal/notify"
 	"alerting/internal/state"
 )
 
-// BenchmarkIngestThroughput measures end-to-end ingest path through manager logic.
-// Target reference for MVP acceptance is 10k events/sec.
+// BenchmarkIngestThroughput measures real HTTP ingest path throughput:
+// producer -> HTTP /ingest -> manager pipeline.
 func BenchmarkIngestThroughput(b *testing.B) {
 	for _, metric := range allE2EMetricCases() {
 		metric := metric
@@ -55,40 +61,159 @@ func BenchmarkIngestThroughput(b *testing.B) {
 			}()
 			dispatcher := notify.NewDispatcher(config.NotifyConfig{}, logger)
 			manager := app.NewManager(cfg, logger, store, dispatcher, clock.RealClock{})
+			sink := &countingSink{manager: manager}
+			httpHandler := ingest.NewHTTPHandler(sink, 1<<20)
+			httpServer := httptest.NewServer(httpHandler)
+			defer httpServer.Close()
 
-			event := domain.Event{
-				DT:   time.Now().UnixMilli(),
-				Type: "event",
-				Tags: map[string]string{
-					"dc":      "dc1",
-					"service": "api",
-					"host":    "bench-host",
-				},
-				Var: e2eMetricVar,
-				Value: domain.TypedValue{
-					Type: "n",
-					N:    ptrFloat(1),
-				},
-				AggCnt: 1,
-				Win:    0,
+			httpClient := &http.Client{
+				Timeout: 10 * time.Second,
 			}
+
+			eventJSON := []byte(`{"dt":1739876543210,"type":"event","tags":{"dc":"dc1","service":"api","host":"bench-host"},"var":"errors","value":{"t":"n","n":1},"agg_cnt":1,"win":0}`)
 
 			b.ReportAllocs()
 			b.ResetTimer()
+			startedAt := time.Now()
 			for i := 0; i < b.N; i++ {
-				if err := manager.Push(event); err != nil {
-					b.Fatalf("push failed: %v", err)
+				request, err := http.NewRequest(http.MethodPost, httpServer.URL, bytes.NewReader(eventJSON))
+				if err != nil {
+					b.Fatalf("new request: %v", err)
+				}
+				request.Header.Set("Content-Type", "application/json")
+				response, err := httpClient.Do(request)
+				if err != nil {
+					b.Fatalf("http ingest event %d: %v", i, err)
+				}
+				_ = response.Body.Close()
+				if response.StatusCode != http.StatusAccepted {
+					b.Fatalf("http ingest status: got=%d want=%d", response.StatusCode, http.StatusAccepted)
 				}
 			}
 
-			eventsPerSecond := float64(b.N) / b.Elapsed().Seconds()
+			processed := sink.count.Load()
+			elapsed := time.Since(startedAt)
+			eventsPerSecond := float64(processed) / elapsed.Seconds()
+			backlog := int64(b.N) - processed
+			if backlog < 0 {
+				backlog = 0
+			}
 			b.ReportMetric(eventsPerSecond, "events/sec")
+			b.ReportMetric(float64(processed), "processed_events")
+			b.ReportMetric(float64(backlog), "backlog_events")
 		})
 	}
 }
 
-func ptrFloat(value float64) *float64 {
-	return &value
+// BenchmarkHTTPBatchIngestThroughput measures HTTP batch ingest throughput:
+// producer -> HTTP /ingest/batch -> manager pipeline.
+func BenchmarkHTTPBatchIngestThroughput(b *testing.B) {
+	batchSize := benchmarkBatchSizeFromEnv("E2E_HTTP_BATCH_SIZE", 10)
+
+	for _, metric := range allE2EMetricCases() {
+		metric := metric
+		b.Run(metric.Name, func(b *testing.B) {
+			natsURL, stopNATS := startLocalNATSServer(b)
+			defer stopNATS()
+
+			tickBucket := "tick_bench_http_batch_" + metric.Name
+			dataBucket := "data_bench_http_batch_" + metric.Name
+			ensureStateBuckets(b, natsURL, tickBucket, dataBucket)
+
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			cfg := config.Config{
+				Notify: config.NotifyConfig{
+					Repeat:           false,
+					RepeatEverySec:   300,
+					RepeatOn:         []string{"firing"},
+					RepeatPerChannel: true,
+					OnPending:        false,
+				},
+				Rule: []config.RuleConfig{
+					benchmarkRuleForMetric(metric, "bench_http_batch_"+metric.Name),
+				},
+			}
+
+			store, err := state.NewNATSStore(config.NATSStateConfig{
+				URL:                []string{natsURL},
+				TickBucket:         tickBucket,
+				DataBucket:         dataBucket,
+				AllowCreateBuckets: true,
+			})
+			if err != nil {
+				b.Fatalf("new nats store: %v", err)
+			}
+			defer func() {
+				_ = store.Close()
+			}()
+			dispatcher := notify.NewDispatcher(config.NotifyConfig{}, logger)
+			manager := app.NewManager(cfg, logger, store, dispatcher, clock.RealClock{})
+			sink := &countingSink{manager: manager}
+			httpHandler := ingest.NewHTTPHandler(sink, 1<<20)
+			httpServer := httptest.NewServer(httpHandler)
+			defer httpServer.Close()
+
+			httpClient := &http.Client{
+				Timeout: 10 * time.Second,
+			}
+			batchJSON := buildBatchPayload(batchSize)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			startedAt := time.Now()
+			for i := 0; i < b.N; i++ {
+				request, err := http.NewRequest(http.MethodPost, httpServer.URL+"/batch", bytes.NewReader(batchJSON))
+				if err != nil {
+					b.Fatalf("new request: %v", err)
+				}
+				request.Header.Set("Content-Type", "application/json")
+				response, err := httpClient.Do(request)
+				if err != nil {
+					b.Fatalf("http batch ingest request %d: %v", i, err)
+				}
+				_ = response.Body.Close()
+				if response.StatusCode != http.StatusAccepted {
+					b.Fatalf("http batch ingest status: got=%d want=%d", response.StatusCode, http.StatusAccepted)
+				}
+			}
+
+			processed := sink.count.Load()
+			elapsed := time.Since(startedAt)
+			expected := int64(b.N * batchSize)
+			eventsPerSecond := float64(processed) / elapsed.Seconds()
+			requestsPerSecond := float64(b.N) / elapsed.Seconds()
+			backlog := expected - processed
+			if backlog < 0 {
+				backlog = 0
+			}
+			b.ReportMetric(eventsPerSecond, "events/sec")
+			b.ReportMetric(requestsPerSecond, "req/sec")
+			b.ReportMetric(float64(processed), "processed_events")
+			b.ReportMetric(float64(backlog), "backlog_events")
+		})
+	}
+}
+
+func buildBatchPayload(size int) []byte {
+	if size <= 0 {
+		return []byte("[]")
+	}
+	payload := bytes.Repeat([]byte(`{"dt":1739876543210,"type":"event","tags":{"dc":"dc1","service":"api","host":"bench-host"},"var":"errors","value":{"t":"n","n":1},"agg_cnt":1,"win":0},`), size)
+	payload[len(payload)-1] = ']'
+	payload = append([]byte{'['}, payload...)
+	return payload
+}
+
+func benchmarkBatchSizeFromEnv(envName string, defaultValue int) int {
+	raw := strings.TrimSpace(os.Getenv(envName))
+	if raw == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed <= 0 {
+		return defaultValue
+	}
+	return parsed
 }
 
 func benchmarkRuleForMetric(metric e2eMetricCase, name string) config.RuleConfig {

@@ -64,6 +64,39 @@ func DecodeEvent(raw []byte) (Event, error) {
 	return event, nil
 }
 
+// DecodeEventReader decodes and validates one event payload from stream.
+// Params: reader with one JSON object.
+// Returns: validated event or decode/validation error.
+func DecodeEventReader(reader *json.Decoder) (Event, error) {
+	var event Event
+	if err := reader.Decode(&event); err != nil {
+		return Event{}, fmt.Errorf("decode event: %w", err)
+	}
+	if err := event.Validate(); err != nil {
+		return Event{}, err
+	}
+	return event, nil
+}
+
+// DecodeEventsReader decodes and validates one batch of events from stream.
+// Params: reader with one JSON array of events.
+// Returns: validated events slice or decode/validation error.
+func DecodeEventsReader(reader *json.Decoder) ([]Event, error) {
+	var events []Event
+	if err := reader.Decode(&events); err != nil {
+		return nil, fmt.Errorf("decode event batch: %w", err)
+	}
+	if len(events) == 0 {
+		return nil, errors.New("event batch must contain at least one event")
+	}
+	for i := range events {
+		if err := events[i].Validate(); err != nil {
+			return nil, fmt.Errorf("event[%d]: %w", i, err)
+		}
+	}
+	return events, nil
+}
+
 // Validate validates one event against the contract.
 // Params: event fields parsed from transport.
 // Returns: validation error when schema is violated.

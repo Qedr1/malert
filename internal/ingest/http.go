@@ -1,8 +1,9 @@
 package ingest
 
 import (
-	"io"
+	"encoding/json"
 	"net/http"
+	"strings"
 
 	"alerting/internal/domain"
 )
@@ -20,6 +21,10 @@ type EventSink interface {
 type HTTPHandler struct {
 	sink        EventSink
 	maxBodySize int64
+}
+
+type batchEventSink interface {
+	PushBatch(events []domain.Event) error
 }
 
 // NewHTTPHandler creates ingest HTTP handler.
@@ -40,21 +45,48 @@ func (h *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 
 	request.Body = http.MaxBytesReader(writer, request.Body, h.maxBodySize)
 	defer request.Body.Close()
-	body, err := io.ReadAll(request.Body)
-	if err != nil {
-		writer.WriteHeader(http.StatusBadRequest)
+	decoder := json.NewDecoder(request.Body)
+	if isBatchPath(request.URL.Path) {
+		events, decodeErr := domain.DecodeEventsReader(decoder)
+		if decodeErr != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if sink, ok := h.sink.(batchEventSink); ok {
+			if pushErr := sink.PushBatch(events); pushErr != nil {
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			writer.WriteHeader(http.StatusAccepted)
+			return
+		}
+		for _, event := range events {
+			if pushErr := h.sink.Push(event); pushErr != nil {
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+		}
+		writer.WriteHeader(http.StatusAccepted)
 		return
 	}
 
-	event, err := domain.DecodeEvent(body)
-	if err != nil {
+	event, decodeErr := domain.DecodeEventReader(decoder)
+	if decodeErr != nil {
 		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
-	if err := h.sink.Push(event); err != nil {
+	if pushErr := h.sink.Push(event); pushErr != nil {
 		writer.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
+	if decoder.More() {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	writer.WriteHeader(http.StatusAccepted)
+}
+
+func isBatchPath(path string) bool {
+	trimmed := strings.TrimSpace(path)
+	return trimmed == "/batch" || strings.HasSuffix(trimmed, "/batch")
 }

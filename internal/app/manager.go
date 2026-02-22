@@ -59,6 +59,19 @@ func (m *Manager) Push(event domain.Event) error {
 	return m.ProcessEvent(context.Background(), event)
 }
 
+// PushBatch processes batch of incoming events from ingest interfaces.
+// Params: validated incoming event slice.
+// Returns: processing error when backend operation fails.
+func (m *Manager) PushBatch(events []domain.Event) error {
+	ctx := context.Background()
+	for _, event := range events {
+		if err := m.ProcessEvent(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ProcessEvent runs all rule evaluations for one event.
 // Params: context and validated event payload.
 // Returns: first backend error on store/notify failure.

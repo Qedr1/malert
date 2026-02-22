@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -256,6 +257,10 @@ func (s *Service) buildHTTPServer() error {
 	if s.cfg.Ingest.HTTP.Enabled {
 		handler := ingest.NewHTTPHandler(s.manager, s.cfg.Ingest.HTTP.MaxBodyBytes)
 		mux.Handle(s.cfg.Ingest.HTTP.IngestPath, handler)
+		batchPath := strings.TrimSuffix(s.cfg.Ingest.HTTP.IngestPath, "/") + "/batch"
+		if batchPath != s.cfg.Ingest.HTTP.IngestPath {
+			mux.Handle(batchPath, handler)
+		}
 	}
 
 	s.httpSrv = &http.Server{
