@@ -4,11 +4,12 @@
 - NATS Server JetStream (2.12.4+)
 - ClickHouse (25.11+)
 
-Для поддерживаются режимы:
-- single-instance
-- multi-instance (синхронизация через NATS)
-
 ## Режимы работы (single vs multi)
+#### single-instance
+Может быть запущена одна копия сервиса c единственных входящим каналом событий по HTTP
+#### multi-instance 
+Произвольное нечетное количество сервисов с межсервисной синхронизацией через и дополнительным входящим каналом через NATS
+
 | Характеристика | single-instance | multi-instance |
 |---|---|---|
 | Выбор режима | service.mode=single | service.mode=nats (default) |
