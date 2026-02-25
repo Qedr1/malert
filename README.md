@@ -309,6 +309,51 @@ DOWN:
 ```
 Пример: configs/alerts/rules.missing_heartbeat.toml.
 
+## Паттерны написания правил алертов
+
+### Общий каркас правила
+```toml
+[rule.<rule_name>]
+# Тип алерта (count_total | count_window | missing_heartbeat).
+alert_type = "count_total"
+
+[rule.<rule_name>.match]
+# Разрешенные типы событий для этого правила.
+type = ["event"]
+# Разрешенные var для этого правила.
+var = ["errors"]
+# Allow-only фильтр тегов: событие подходит только если все указанные теги совпали.
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.<rule_name>.key]
+# Теги, формирующие уникальность alert_id (кардинальность алертов).
+from_tags = ["dc", "service", "host"]
+
+[rule.<rule_name>.raise]
+# Параметры взведения (зависят от alert_type).
+
+[rule.<rule_name>.resolve]
+# Параметры опускания (зависят от alert_type).
+# Для всех типов доступен общий гистерезис.
+hysteresis_sec = 0
+
+[rule.<rule_name>.pending]
+# Включить/выключить стадию pending перед firing.
+enabled = false
+# Время удержания условия в pending до перехода в firing.
+delay_sec = 300
+
+[[rule.<rule_name>.notify.route]]
+# Канал доставки (telegram | mattermost | jira | youtrack | http).
+channel = "telegram"
+# Имя шаблона из [[notify.<channel>.name-template]].
+template = "tg_default"
+```
+
+Практика анти-флап:
+- если алерт «дергается» между `firing/resolved`, сначала увеличивайте `resolve.hysteresis_sec`;
+- если алерт часто кратковременно входит в `firing`, включайте `pending.enabled=true` и настраивайте `pending.delay_sec`.
+
 # Доставка уведомлений
 Общая схема доставки:
 - при notify.queue.enabled=true: event -> alert decision -> Notification -> notify.queue (JetStream) -> delivery worker -> transport channel;
@@ -476,6 +521,7 @@ rule_name специальных ограничений формата не им
 
 
 ### Single-instance
+Самый компактный способ работы сервиса но и самый ненадежный. Недоступность одного сервиса  - это недоступность всей функции алертинга. Применять только для алертинга некртичных контуров.
 ```toml
 # base.toml
 [service]
