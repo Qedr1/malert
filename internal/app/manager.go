@@ -35,6 +35,11 @@ type Manager struct {
 	clock      clock.Clock
 }
 
+type tickRefresh struct {
+	lastSeen time.Time
+	ttl      time.Duration
+}
+
 // NewManager creates manager with initial configuration.
 // Params: initial config, logger, state store, notifier dispatcher, and clock.
 // Returns: initialized manager.
@@ -56,7 +61,7 @@ func NewManager(cfg config.Config, logger *slog.Logger, store state.Store, dispa
 // Params: validated incoming event.
 // Returns: processing error when backend operation fails.
 func (m *Manager) Push(event domain.Event) error {
-	return m.ProcessEvent(context.Background(), event)
+	return m.processEvent(context.Background(), event, nil)
 }
 
 // PushBatch processes batch of incoming events from ingest interfaces.
@@ -64,10 +69,14 @@ func (m *Manager) Push(event domain.Event) error {
 // Returns: processing error when backend operation fails.
 func (m *Manager) PushBatch(events []domain.Event) error {
 	ctx := context.Background()
+	pendingTickRefresh := make(map[string]tickRefresh)
 	for _, event := range events {
-		if err := m.ProcessEvent(ctx, event); err != nil {
+		if err := m.processEvent(ctx, event, pendingTickRefresh); err != nil {
 			return err
 		}
+	}
+	if err := m.flushTickRefresh(ctx, pendingTickRefresh); err != nil {
+		return err
 	}
 	return nil
 }
@@ -76,6 +85,10 @@ func (m *Manager) PushBatch(events []domain.Event) error {
 // Params: context and validated event payload.
 // Returns: first backend error on store/notify failure.
 func (m *Manager) ProcessEvent(ctx context.Context, event domain.Event) error {
+	return m.processEvent(ctx, event, nil)
+}
+
+func (m *Manager) processEvent(ctx context.Context, event domain.Event, pendingTickRefresh map[string]tickRefresh) error {
 	now := m.clock.Now()
 
 	m.mu.RLock()
@@ -100,7 +113,7 @@ func (m *Manager) ProcessEvent(ctx context.Context, event domain.Event) error {
 		if !decision.Matched {
 			continue
 		}
-		if err := m.applyDecision(ctx, rule, alertID, decision, now); err != nil {
+		if err := m.applyDecision(ctx, rule, alertID, decision, now, pendingTickRefresh); err != nil {
 			return err
 		}
 	}
@@ -122,7 +135,7 @@ func (m *Manager) Tick(ctx context.Context) error {
 	for _, rule := range rules {
 		decisions, firingAlertIDs := m.engine.TickRuleWithFiring(rule, now)
 		for _, decision := range decisions {
-			if err := m.applyDecision(ctx, rule, decision.AlertID, decision, now); err != nil {
+			if err := m.applyDecision(ctx, rule, decision.AlertID, decision, now, nil); err != nil {
 				return err
 			}
 		}
@@ -131,33 +144,32 @@ func (m *Manager) Tick(ctx context.Context) error {
 		repeatEvery := m.repeatEvery(rule)
 		routes := rule.Notify.Route
 		for _, alertID := range firingAlertIDs {
-			runtimeState, exists := m.engine.GetStateSnapshot(alertID)
+			repeatSnapshot, exists := m.engine.GetRepeatSnapshot(alertID)
 			if !exists {
 				continue
 			}
-			if runtimeState.CurrentState != domain.AlertStateFiring || !repeatEnabled || len(routes) == 0 {
+			if !repeatEnabled || len(routes) == 0 {
 				continue
 			}
-			notification := domain.Notification{
-				AlertID:     runtimeState.AlertID,
-				ShortID:     shortAlertID(runtimeState.AlertID),
-				RuleName:    runtimeState.RuleName,
-				Var:         runtimeState.Var,
-				Tags:        runtimeState.Tags,
-				State:       domain.AlertStateFiring,
-				Message:     "firing repeat",
-				MetricValue: runtimeState.MetricValue,
-				StartedAt:   startedAt(runtimeState.RaisedAt, now),
-				Timestamp:   now,
-			}
+			notification := buildNotification(
+				alertID,
+				rule.Name,
+				repeatSnapshot.Var,
+				repeatSnapshot.Tags,
+				repeatSnapshot.MetricValue,
+				domain.AlertStateFiring,
+				"firing repeat",
+				now,
+				repeatSnapshot.RaisedAt,
+			)
 
 			if !repeatPerChannel {
-				last := runtimeState.LastNotified["global"]
+				last := repeatSnapshot.LastNotified["global"]
 				if !last.IsZero() && now.Sub(last) < repeatEvery {
 					continue
 				}
 				if err := m.dispatchNotification(ctx, rule, notification); err != nil {
-					m.logger.Error("repeat notification failed", "rule", rule.Name, "alert_id", runtimeState.AlertID, "error", err.Error())
+					m.logger.Error("repeat notification failed", "rule", rule.Name, "alert_id", alertID, "error", err.Error())
 				}
 				continue
 			}
@@ -168,12 +180,12 @@ func (m *Manager) Tick(ctx context.Context) error {
 					continue
 				}
 				notifyKey := normalizedRoute.Key
-				last := runtimeState.LastNotified[notifyKey]
+				last := repeatSnapshot.LastNotified[notifyKey]
 				if !last.IsZero() && now.Sub(last) < repeatEvery {
 					continue
 				}
 				if err := m.dispatchNotification(ctx, rule, notification, route); err != nil {
-					m.logger.Error("repeat notification failed", "rule", rule.Name, "alert_id", runtimeState.AlertID, "error", err.Error())
+					m.logger.Error("repeat notification failed", "rule", rule.Name, "alert_id", alertID, "error", err.Error())
 					continue
 				}
 			}
@@ -332,19 +344,19 @@ func (m *Manager) cleanupRemovedRule(ctx context.Context, removedRule config.Rul
 					card.RaisedAt = now
 				}
 			}
-			_ = m.dispatchNotification(ctx, removedRule, domain.Notification{
-				AlertID:     card.AlertID,
-				ShortID:     shortAlertID(card.AlertID),
-				RuleName:    card.RuleName,
-				Var:         card.Var,
-				Tags:        card.Tags,
-				State:       domain.AlertStateResolved,
-				Message:     "resolved due rule removal",
-				MetricValue: card.MetricValue,
-				StartedAt:   startedAt(card.RaisedAt, now),
-				Duration:    alertDuration(card.RaisedAt, now),
-				Timestamp:   now,
-			})
+			notification := buildNotification(
+				card.AlertID,
+				card.RuleName,
+				card.Var,
+				card.Tags,
+				card.MetricValue,
+				domain.AlertStateResolved,
+				"resolved due rule removal",
+				now,
+				card.RaisedAt,
+			)
+			notification.Duration = alertDuration(card.RaisedAt, now)
+			_ = m.dispatchNotification(ctx, removedRule, notification)
 		}
 		_ = m.store.DeleteCard(ctx, alertID)
 		m.engine.RemoveAlertState(alertID)
@@ -355,7 +367,7 @@ func (m *Manager) cleanupRemovedRule(ctx context.Context, removedRule config.Rul
 // applyDecision persists state transition and emits notifications.
 // Params: rule, alert ID, engine decision, and current time.
 // Returns: backend error from store or notifier.
-func (m *Manager) applyDecision(ctx context.Context, rule config.RuleConfig, alertID string, decision domain.Decision, now time.Time) error {
+func (m *Manager) applyDecision(ctx context.Context, rule config.RuleConfig, alertID string, decision domain.Decision, now time.Time, pendingTickRefresh map[string]tickRefresh) error {
 	if !decision.ShouldStore && !decision.ShouldNotify {
 		return nil
 	}
@@ -371,8 +383,14 @@ func (m *Manager) applyDecision(ctx context.Context, rule config.RuleConfig, ale
 
 	if decision.ShouldStore && decision.State != domain.AlertStateResolved {
 		ttl := config.ResolveTimeout(rule)
-		if err := m.store.RefreshTick(ctx, alertID, now, ttl); err != nil {
-			return fmt.Errorf("refresh tick: %w", err)
+		if pendingTickRefresh == nil {
+			if err := m.store.RefreshTick(ctx, alertID, now, ttl); err != nil {
+				return fmt.Errorf("refresh tick: %w", err)
+			}
+		} else {
+			if prev, exists := pendingTickRefresh[alertID]; !exists || prev.lastSeen.Before(now) {
+				pendingTickRefresh[alertID] = tickRefresh{lastSeen: now, ttl: ttl}
+			}
 		}
 	}
 
@@ -421,18 +439,17 @@ func (m *Manager) applyDecision(ctx context.Context, rule config.RuleConfig, ale
 	}
 
 	if shouldNotify && !(decision.State == domain.AlertStatePending && !m.notifyOnPending(rule)) {
-		notification := domain.Notification{
-			AlertID:     alertID,
-			ShortID:     shortAlertID(alertID),
-			RuleName:    rule.Name,
-			Var:         identity.Var,
-			Tags:        identity.Tags,
-			State:       decision.State,
-			Message:     m.notificationMessage(decision.State, decision.ResolveCause),
-			MetricValue: metricValue,
-			StartedAt:   startedAt(raisedAt, now),
-			Timestamp:   now,
-		}
+		notification := buildNotification(
+			alertID,
+			rule.Name,
+			identity.Var,
+			identity.Tags,
+			metricValue,
+			decision.State,
+			m.notificationMessage(decision.State, decision.ResolveCause),
+			now,
+			raisedAt,
+		)
 		if decision.State == domain.AlertStateResolved {
 			notification.Duration = alertDuration(raisedAt, now)
 		}
@@ -448,6 +465,15 @@ func (m *Manager) applyDecision(ctx context.Context, rule config.RuleConfig, ale
 		m.engine.RemoveAlertState(alertID)
 	}
 
+	return nil
+}
+
+func (m *Manager) flushTickRefresh(ctx context.Context, pendingTickRefresh map[string]tickRefresh) error {
+	for alertID, tick := range pendingTickRefresh {
+		if err := m.store.RefreshTick(ctx, alertID, tick.lastSeen, tick.ttl); err != nil {
+			return fmt.Errorf("refresh tick: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -992,6 +1018,24 @@ func applyCardStateTransition(card *domain.AlertCard, stateValue domain.AlertSta
 		closedAt := now
 		card.ClosedAt = &closedAt
 		card.ResolveCause = resolveCause
+	}
+}
+
+// buildNotification assembles base notification payload with consistent fields.
+// Params: alert identity, state, message, timestamps.
+// Returns: populated notification payload.
+func buildNotification(alertID, ruleName, varName string, tags map[string]string, metricValue string, state domain.AlertState, message string, now time.Time, raisedAt time.Time) domain.Notification {
+	return domain.Notification{
+		AlertID:     alertID,
+		ShortID:     shortAlertID(alertID),
+		RuleName:    ruleName,
+		Var:         varName,
+		Tags:        tags,
+		State:       state,
+		Message:     message,
+		MetricValue: metricValue,
+		StartedAt:   startedAt(raisedAt, now),
+		Timestamp:   now,
 	}
 }
 

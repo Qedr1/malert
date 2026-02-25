@@ -170,10 +170,7 @@ ingest_path = "/ingest"
 [ingest.nats]
 enabled = true
 url = ["%s"]
-subject = "%s"
-stream = "%s"
-consumer_name = "alerting-ingest-e2e"
-deliver_group = "alerting-workers-e2e"
+workers = 2
 ack_wait_sec = 10
 nack_delay_ms = 100
 max_deliver = -1
@@ -201,7 +198,7 @@ enabled = false
 [[notify.http.name-template]]
 name = "http_default"
 message = "[{{ .RuleName }}] {{ .Message }} state={{ .State }}"
-`, serviceName, port, natsURL, e2eEventsSubj, e2eEventsStream, webhookURL)
+`, serviceName, port, natsURL, webhookURL)
 	return base + buildRuleTOML(ruleName, metric, e2eMetricVar, ruleOptions, fmt.Sprintf(`
 [[rule.%s.notify.route]]
 channel = "http"

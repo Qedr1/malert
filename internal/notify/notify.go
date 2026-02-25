@@ -19,6 +19,7 @@ import (
 
 	"alerting/internal/config"
 	"alerting/internal/domain"
+	"alerting/internal/permanent"
 	"alerting/internal/templatefmt"
 
 	tgbot "github.com/go-telegram/bot"
@@ -64,59 +65,20 @@ type Dispatcher struct {
 // PermanentError marks delivery errors that must not be retried.
 // Params: wrapped root cause.
 // Returns: typed permanent error marker.
-type PermanentError struct {
-	Err error
-}
-
-// Error returns wrapped error message.
-// Params: none.
-// Returns: string representation.
-func (e PermanentError) Error() string {
-	if e.Err == nil {
-		return "permanent notify error"
-	}
-	return e.Err.Error()
-}
-
-// Unwrap exposes wrapped cause for errors.Is/errors.As.
-// Params: none.
-// Returns: wrapped error.
-func (e PermanentError) Unwrap() error {
-	return e.Err
-}
-
-// Permanent marks error as non-retryable.
-// Params: none.
-// Returns: true.
-func (PermanentError) Permanent() bool {
-	return true
-}
+type PermanentError = permanent.Error
 
 // MarkPermanent wraps error with non-retryable marker.
 // Params: source error.
 // Returns: wrapped error or nil.
 func MarkPermanent(err error) error {
-	if err == nil {
-		return nil
-	}
-	return PermanentError{Err: err}
+	return permanent.Mark(err)
 }
 
 // IsPermanent reports whether error is non-retryable.
 // Params: candidate error.
 // Returns: true when permanent marker is present.
 func IsPermanent(err error) bool {
-	if err == nil {
-		return false
-	}
-	type permanent interface {
-		Permanent() bool
-	}
-	var marker permanent
-	if !errors.As(err, &marker) {
-		return false
-	}
-	return marker.Permanent()
+	return permanent.Is(err)
 }
 
 var channelSenderFactories = map[string]func(config.NotifyConfig) ChannelSender{

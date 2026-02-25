@@ -4,11 +4,11 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"time"
 
 	"alerting/internal/domain"
+	"alerting/internal/permanent"
 )
 
 // Job is one outbound notification task in async delivery queue.
@@ -81,59 +81,20 @@ type Producer interface {
 // PermanentError marks processing errors that must not be retried.
 // Params: wrapped root cause error.
 // Returns: error with permanent retry classification.
-type PermanentError struct {
-	Err error
-}
-
-// Error returns wrapped error message.
-// Params: none.
-// Returns: string representation.
-func (e PermanentError) Error() string {
-	if e.Err == nil {
-		return "permanent notify error"
-	}
-	return e.Err.Error()
-}
-
-// Unwrap exposes wrapped error for errors.Is/errors.As.
-// Params: none.
-// Returns: wrapped cause.
-func (e PermanentError) Unwrap() error {
-	return e.Err
-}
-
-// Permanent marks error as non-retryable for queue workers.
-// Params: none.
-// Returns: true.
-func (PermanentError) Permanent() bool {
-	return true
-}
+type PermanentError = permanent.Error
 
 // MarkPermanent wraps error as permanent processing failure.
 // Params: source error.
 // Returns: wrapped permanent error (or nil when input is nil).
 func MarkPermanent(err error) error {
-	if err == nil {
-		return nil
-	}
-	return PermanentError{Err: err}
+	return permanent.Mark(err)
 }
 
 // IsPermanent reports whether error is marked as non-retryable.
 // Params: processing error.
 // Returns: true when worker must not retry.
 func IsPermanent(err error) bool {
-	if err == nil {
-		return false
-	}
-	type permanent interface {
-		Permanent() bool
-	}
-	var marker permanent
-	if !errors.As(err, &marker) {
-		return false
-	}
-	return marker.Permanent()
+	return permanent.Is(err)
 }
 
 // Worker consumes queued jobs and acknowledges delivery status.

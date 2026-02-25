@@ -15,6 +15,12 @@ import (
 
 const notifyStreamMaxAge = 24 * time.Hour
 const notifyDLQStreamMaxAge = 7 * 24 * time.Hour
+const notifyQueueStream = "ALERTING_NOTIFY"
+const notifyQueueSubject = "alerting.notify.jobs"
+const notifyQueueConsumer = "alerting-notify"
+const notifyQueueGroup = "alerting-notify-workers"
+const notifyQueueDLQStream = "ALERTING_NOTIFY_DLQ"
+const notifyQueueDLQSubject = "alerting.notify.jobs.dlq"
 
 // NATSProducer publishes notification jobs into JetStream stream.
 // Params: NATS connection and publish subject settings.
@@ -33,7 +39,7 @@ func NewNATSProducer(cfg config.NotifyQueue) (*NATSProducer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &NATSProducer{nc: nc, js: js, subject: cfg.Subject}, nil
+	return &NATSProducer{nc: nc, js: js, subject: notifyQueueSubject}, nil
 }
 
 // Enqueue publishes one notification job into queue stream.
@@ -74,7 +80,7 @@ type NATSWorker struct {
 	js     nats.JetStreamContext
 	sub    *nats.Subscription
 	logger *slog.Logger
-	dlq    config.NotifyQueueDLQ
+	dlq    bool
 }
 
 // NewNATSWorker starts queue consumer for notification delivery jobs.
@@ -90,8 +96,8 @@ func NewNATSWorker(cfg config.NotifyQueue, logger *slog.Logger, handler func(ctx
 	ackWait := time.Duration(cfg.AckWaitSec) * time.Second
 	nackDelay := time.Duration(cfg.NackDelayMS) * time.Millisecond
 	subOpts := []nats.SubOpt{
-		nats.BindStream(cfg.Stream),
-		nats.Durable(cfg.ConsumerName),
+		nats.BindStream(notifyQueueStream),
+		nats.Durable(notifyQueueConsumer),
 		nats.ManualAck(),
 		nats.AckExplicit(),
 		nats.AckWait(ackWait),
@@ -99,7 +105,7 @@ func NewNATSWorker(cfg config.NotifyQueue, logger *slog.Logger, handler func(ctx
 		nats.MaxAckPending(cfg.MaxAckPending),
 		nats.DeliverAll(),
 	}
-	sub, err := js.QueueSubscribe(cfg.Subject, cfg.DeliverGroup, func(message *nats.Msg) {
+	sub, err := js.QueueSubscribe(notifyQueueSubject, notifyQueueGroup, func(message *nats.Msg) {
 		if message == nil {
 			return
 		}
@@ -124,7 +130,7 @@ func NewNATSWorker(cfg config.NotifyQueue, logger *slog.Logger, handler func(ctx
 					reason = DLQReasonMaxDeliverExceeded
 				}
 				if reason != "" {
-					if worker.dlq.Enabled {
+					if worker.dlq {
 						if dlqErr := worker.publishDLQ(context.Background(), message, job, reason, err, attempts, cfg.MaxDeliver); dlqErr != nil {
 							if logger != nil {
 								logger.Error("notify queue dlq publish failed", "job_id", job.ID, "channel", job.Channel, "reason", reason, "error", dlqErr.Error())
@@ -152,7 +158,7 @@ func NewNATSWorker(cfg config.NotifyQueue, logger *slog.Logger, handler func(ctx
 	}, subOpts...)
 	if err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("queue subscribe notify %q/%q: %w", cfg.Subject, cfg.DeliverGroup, err)
+		return nil, fmt.Errorf("queue subscribe notify %q/%q: %w", notifyQueueSubject, notifyQueueGroup, err)
 	}
 	worker.sub = sub
 	return worker, nil
@@ -205,10 +211,10 @@ func ensureStream(
 }
 
 // openNotifyQueueJetStream opens connection/JetStream and ensures notify queue stream exists.
-// Params: queue config with URL and stream/subject names.
+// Params: queue config with URL, ack policy, and DLQ flag.
 // Returns: opened NATS connection, JetStream context, and setup error.
 func openNotifyQueueJetStream(cfg config.NotifyQueue) (*nats.Conn, nats.JetStreamContext, error) {
-	nc, err := nats.Connect(cfg.URL)
+	nc, err := nats.Connect(strings.Join(cfg.URL, ","))
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect notify queue nats: %w", err)
 	}
@@ -217,12 +223,12 @@ func openNotifyQueueJetStream(cfg config.NotifyQueue) (*nats.Conn, nats.JetStrea
 		nc.Close()
 		return nil, nil, fmt.Errorf("jetstream init for notify queue: %w", err)
 	}
-	if err := ensureStream(js, cfg.Stream, cfg.Subject, nats.WorkQueuePolicy, notifyStreamMaxAge); err != nil {
+	if err := ensureStream(js, notifyQueueStream, notifyQueueSubject, nats.WorkQueuePolicy, notifyStreamMaxAge); err != nil {
 		nc.Close()
 		return nil, nil, err
 	}
-	if cfg.DLQ.Enabled {
-		if err := ensureStream(js, cfg.DLQ.Stream, cfg.DLQ.Subject, nats.LimitsPolicy, notifyDLQStreamMaxAge); err != nil {
+	if cfg.DLQ {
+		if err := ensureStream(js, notifyQueueDLQStream, notifyQueueDLQSubject, nats.LimitsPolicy, notifyDLQStreamMaxAge); err != nil {
 			nc.Close()
 			return nil, nil, err
 		}
@@ -266,7 +272,7 @@ func (w *NATSWorker) publishDLQ(
 	attempts uint64,
 	maxDeliver int,
 ) error {
-	if w == nil || w.js == nil || !w.dlq.Enabled {
+	if w == nil || w.js == nil || !w.dlq {
 		return nil
 	}
 	entry := DLQEntry{
@@ -285,7 +291,7 @@ func (w *NATSWorker) publishDLQ(
 	if err != nil {
 		return fmt.Errorf("marshal notify dlq entry: %w", err)
 	}
-	msg := nats.NewMsg(w.dlq.Subject)
+	msg := nats.NewMsg(notifyQueueDLQSubject)
 	msg.Data = body
 	if strings.TrimSpace(job.ID) != "" {
 		msg.Header.Set("Nats-Msg-Id", strings.TrimSpace(job.ID)+":dlq:"+string(reason)+":"+fmt.Sprintf("%d", attempts))

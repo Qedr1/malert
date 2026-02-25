@@ -81,12 +81,7 @@ func TestNotifyQueueBestEffortPerChannelE2E(t *testing.T) {
 			configPath := filepath.Join(tmpDir, "config.toml")
 			cfg := e2eStandardConfigPrefix(port, natsURL) + fmt.Sprintf(`
 [notify.queue]
-	enabled = true
-	url = "%s"
-	subject = "alerting.notify.jobs.best-effort"
-stream = "ALERTING_NOTIFY_BEST_EFFORT"
-consumer_name = "alerting-notify-best-effort"
-deliver_group = "alerting-notify-best-effort"
+		enabled = true
 ack_wait_sec = 5
 nack_delay_ms = 10
 max_deliver = 1
@@ -119,9 +114,9 @@ max_ack_pending = 1024
 	enabled = false
 
 [[notify.mattermost.name-template]]
-	name = "mm_default"
-	message = "{{ .RuleName }} {{ .State }} {{ .Var }}={{ .MetricValue }}"
-	`, natsURL, httpSink.URL, mattermostSink.URL)
+		name = "mm_default"
+		message = "{{ .RuleName }} {{ .State }} {{ .Var }}={{ .MetricValue }}"
+		`, httpSink.URL, mattermostSink.URL)
 			cfg += buildRuleTOML(ruleName, metric, e2eMetricVar, ruleOptions, fmt.Sprintf(`
 [[rule.%[1]s.notify.route]]
 channel = "http"
@@ -194,20 +189,11 @@ func TestNotifyQueueDLQOnMaxDeliverE2E(t *testing.T) {
 			cfg := e2eStandardConfigPrefix(port, natsURL) + fmt.Sprintf(`
 [notify.queue]
 enabled = true
-url = "%s"
-subject = "alerting.notify.jobs.dlq-e2e"
-stream = "ALERTING_NOTIFY_DLQ_E2E"
-consumer_name = "alerting-notify-dlq-e2e"
-deliver_group = "alerting-notify-dlq-e2e"
+dlq = true
 ack_wait_sec = 5
 nack_delay_ms = 10
 max_deliver = 1
 max_ack_pending = 1024
-
-[notify.queue.dlq]
-enabled = true
-subject = "alerting.notify.jobs.dlq-e2e.dead"
-stream = "ALERTING_NOTIFY_DLQ_E2E_DEAD"
 
 [notify.telegram]
 enabled = false
@@ -225,7 +211,7 @@ enabled = false
 [[notify.mattermost.name-template]]
 name = "mm_default"
 message = "{{ .RuleName }} {{ .State }} {{ .Var }}={{ .MetricValue }}"
-`, natsURL, mattermostSink.URL)
+`, mattermostSink.URL)
 			cfg += buildRuleTOML(ruleName, metric, e2eMetricVar, ruleOptions, fmt.Sprintf(`
 [[rule.%s.notify.route]]
 channel = "mattermost"
@@ -241,7 +227,7 @@ template = "mm_default"
 				t.Fatalf("connect nats: %v", err)
 			}
 			defer nc.Close()
-			dlqSub, err := nc.SubscribeSync("alerting.notify.jobs.dlq-e2e.dead")
+			dlqSub, err := nc.SubscribeSync("alerting.notify.jobs.dlq")
 			if err != nil {
 				t.Fatalf("subscribe dlq: %v", err)
 			}

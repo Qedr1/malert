@@ -4,6 +4,7 @@ import (
 	"net"
 	"os/exec"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -43,9 +44,25 @@ func StartLocalNATSServer(tb testing.TB) (string, func()) {
 	url := "nats://127.0.0.1:" + strconv.Itoa(port)
 	WaitForNATSReady(tb, url, 8*time.Second)
 
+	var stopOnce sync.Once
 	stop := func() {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-		_, _ = cmd.Process.Wait()
+		stopOnce.Do(func() {
+			if cmd.Process == nil {
+				return
+			}
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			done := make(chan struct{})
+			go func() {
+				_, _ = cmd.Process.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				_ = cmd.Process.Kill()
+				<-done
+			}
+		})
 	}
 	return url, stop
 }

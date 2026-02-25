@@ -8,10 +8,10 @@
 enabled = true
 # Токен Telegram бота (BotFather).
 # ВАЖНО: это секрет; при утечке токен нужно ротировать.
-bot_token = "8248507422:AAF_HDdFOzJierO_uXN6Jp6Mov6ruA5QL2o"
+bot_token = "8248507422:AAF_HDdFOzJierO_uXN6Jp61236ruA5QL2o"
 # chat_id канала/группы/чата для отправки уведомлений.
 # Для каналов обычно формат вида -100xxxxxxxxxx.
-chat_id = "-1003786439421"
+chat_id = "-1003786123421"
 
 [notify.telegram.retry]
 # Политика ретраев именно для Telegram транспорта.

@@ -46,6 +46,7 @@ func (sink *countingSink) PushBatch(events []domain.Event) error {
 // producer -> NATS stream -> JetStream queue consumer -> manager pipeline.
 func BenchmarkNATSQueueIngestThroughput(b *testing.B) {
 	batchSize := benchmarkBatchSizeFromEnv("E2E_NATS_BATCH_SIZE", 1)
+	workers := benchmarkBatchSizeFromEnv("E2E_NATS_WORKERS", 1)
 	flushEveryBatch := batchSize > 1
 
 	for _, metric := range allE2EMetricCases() {
@@ -58,6 +59,7 @@ func BenchmarkNATSQueueIngestThroughput(b *testing.B) {
 			tickBucket := "tick_bench_queue_" + metric.Name
 			dataBucket := "data_bench_queue_" + metric.Name
 			ensureStateBuckets(b, natsURL, tickBucket, dataBucket)
+			defer cleanupBenchmarkNATSArtifacts(b, natsURL, e2eEventsStream, tickBucket, dataBucket)
 
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 			cfg := config.Config{
@@ -69,6 +71,7 @@ func BenchmarkNATSQueueIngestThroughput(b *testing.B) {
 						Stream:        e2eEventsStream,
 						ConsumerName:  "bench-ingest-" + metric.Name,
 						DeliverGroup:  "bench-workers-" + metric.Name,
+						Workers:       workers,
 						AckWaitSec:    10,
 						NackDelayMS:   5,
 						MaxDeliver:    -1,
@@ -118,15 +121,17 @@ func BenchmarkNATSQueueIngestThroughput(b *testing.B) {
 			defer nc.Close()
 
 			eventJSON := []byte(`{"dt":1739876543210,"type":"event","tags":{"dc":"dc1","service":"api","host":"bench-host"},"var":"errors","value":{"t":"n","n":1},"agg_cnt":1,"win":0}`)
+			payload := eventJSON
+			if batchSize > 1 {
+				payload = buildBatchPayload(batchSize)
+			}
 
 			b.ReportAllocs()
 			b.ResetTimer()
 			startedAt := time.Now()
 			for i := 0; i < b.N; i++ {
-				for j := 0; j < batchSize; j++ {
-					if err := nc.Publish(e2eEventsSubj, eventJSON); err != nil {
-						b.Fatalf("publish event batch=%d item=%d: %v", i, j, err)
-					}
+				if err := nc.Publish(e2eEventsSubj, payload); err != nil {
+					b.Fatalf("publish event batch=%d: %v", i, err)
 				}
 				if flushEveryBatch {
 					if err := nc.FlushTimeout(10 * time.Second); err != nil {
@@ -141,10 +146,10 @@ func BenchmarkNATSQueueIngestThroughput(b *testing.B) {
 			}
 
 			expected := int64(b.N * batchSize)
-			deadline := time.Now().Add(5 * time.Minute)
+			deadline := time.Now().Add(60 * time.Second)
 			for sink.count.Load() < expected {
 				if time.Now().After(deadline) {
-					b.Fatalf("queue path timeout: processed=%d sent=%d", sink.count.Load(), expected)
+					break
 				}
 				time.Sleep(2 * time.Millisecond)
 			}
@@ -161,6 +166,9 @@ func BenchmarkNATSQueueIngestThroughput(b *testing.B) {
 			b.ReportMetric(requestsPerSecond, "req/sec")
 			b.ReportMetric(float64(processed), "processed_events")
 			b.ReportMetric(float64(backlog), "backlog_events")
+			if backlog > 0 {
+				b.Fatalf("queue path drain timeout: processed=%d sent=%d backlog=%d", processed, expected, backlog)
+			}
 		})
 	}
 }

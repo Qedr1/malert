@@ -16,14 +16,10 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-func newTestQueueConfig(natsURL, subject, stream, consumer string, maxDeliver int) config.NotifyQueue {
+func newTestQueueConfig(natsURL string, maxDeliver int) config.NotifyQueue {
 	return config.NotifyQueue{
 		Enabled:       true,
-		URL:           natsURL,
-		Subject:       subject,
-		Stream:        stream,
-		ConsumerName:  consumer,
-		DeliverGroup:  consumer,
+		URL:           []string{natsURL},
 		AckWaitSec:    2,
 		NackDelayMS:   10,
 		MaxDeliver:    maxDeliver,
@@ -66,7 +62,7 @@ func TestNATSProducerWorkerRedelivery(t *testing.T) {
 	natsURL, stopNATS := testutil.StartLocalNATSServer(t)
 	defer stopNATS()
 
-	cfg := newTestQueueConfig(natsURL, "alerting.notify.jobs.test", "ALERTING_NOTIFY_TEST", "alerting-notify-test", 3)
+	cfg := newTestQueueConfig(natsURL, 3)
 
 	producer, err := NewNATSProducer(cfg)
 	if err != nil {
@@ -134,18 +130,8 @@ func TestNATSWorkerPublishesPermanentErrorToDLQ(t *testing.T) {
 	natsURL, stopNATS := testutil.StartLocalNATSServer(t)
 	defer stopNATS()
 
-	cfg := newTestQueueConfig(
-		natsURL,
-		"alerting.notify.jobs.dlq.perm",
-		"ALERTING_NOTIFY_DLQ_PERM",
-		"alerting-notify-dlq-perm",
-		3,
-	)
-	cfg.DLQ = config.NotifyQueueDLQ{
-		Enabled: true,
-		Subject: "alerting.notify.jobs.dlq.perm.dlq",
-		Stream:  "ALERTING_NOTIFY_DLQ_PERM_STREAM",
-	}
+	cfg := newTestQueueConfig(natsURL, 3)
+	cfg.DLQ = true
 
 	producer, err := NewNATSProducer(cfg)
 	if err != nil {
@@ -168,7 +154,7 @@ func TestNATSWorkerPublishesPermanentErrorToDLQ(t *testing.T) {
 		t.Fatalf("connect nats: %v", err)
 	}
 	defer nc.Close()
-	sub, err := nc.SubscribeSync(cfg.DLQ.Subject)
+	sub, err := nc.SubscribeSync(notifyQueueDLQSubject)
 	if err != nil {
 		t.Fatalf("subscribe dlq: %v", err)
 	}
@@ -222,19 +208,9 @@ func TestNATSWorkerPublishesMaxDeliverToDLQ(t *testing.T) {
 	natsURL, stopNATS := testutil.StartLocalNATSServer(t)
 	defer stopNATS()
 
-	cfg := newTestQueueConfig(
-		natsURL,
-		"alerting.notify.jobs.dlq.maxdeliver",
-		"ALERTING_NOTIFY_DLQ_MAXDELIVER",
-		"alerting-notify-dlq-maxdeliver",
-		2,
-	)
+	cfg := newTestQueueConfig(natsURL, 2)
 	cfg.AckWaitSec = 1
-	cfg.DLQ = config.NotifyQueueDLQ{
-		Enabled: true,
-		Subject: "alerting.notify.jobs.dlq.maxdeliver.dlq",
-		Stream:  "ALERTING_NOTIFY_DLQ_MAXDELIVER_STREAM",
-	}
+	cfg.DLQ = true
 
 	producer, err := NewNATSProducer(cfg)
 	if err != nil {
@@ -257,7 +233,7 @@ func TestNATSWorkerPublishesMaxDeliverToDLQ(t *testing.T) {
 		t.Fatalf("connect nats: %v", err)
 	}
 	defer nc.Close()
-	sub, err := nc.SubscribeSync(cfg.DLQ.Subject)
+	sub, err := nc.SubscribeSync(notifyQueueDLQSubject)
 	if err != nil {
 		t.Fatalf("subscribe dlq: %v", err)
 	}

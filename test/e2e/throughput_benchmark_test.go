@@ -20,19 +20,21 @@ import (
 	"alerting/internal/state"
 )
 
+func benchmarkServiceMode() string {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("E2E_SERVICE_MODE")))
+	if mode == "" {
+		return "nats"
+	}
+	return mode
+}
+
 // BenchmarkIngestThroughput measures real HTTP ingest path throughput:
 // producer -> HTTP /ingest -> manager pipeline.
 func BenchmarkIngestThroughput(b *testing.B) {
 	for _, metric := range allE2EMetricCases() {
 		metric := metric
 		b.Run(metric.Name, func(b *testing.B) {
-			natsURL, stopNATS := startLocalNATSServer(b)
-			defer stopNATS()
-
-			tickBucket := "tick_bench_ingest_" + metric.Name
-			dataBucket := "data_bench_ingest_" + metric.Name
-			ensureStateBuckets(b, natsURL, tickBucket, dataBucket)
-
+			mode := benchmarkServiceMode()
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 			cfg := config.Config{
 				Notify: config.NotifyConfig{
@@ -47,18 +49,32 @@ func BenchmarkIngestThroughput(b *testing.B) {
 				},
 			}
 
-			store, err := state.NewNATSStore(config.NATSStateConfig{
-				URL:                []string{natsURL},
-				TickBucket:         tickBucket,
-				DataBucket:         dataBucket,
-				AllowCreateBuckets: true,
-			})
-			if err != nil {
-				b.Fatalf("new nats store: %v", err)
+			var store state.Store
+			if mode == "single" {
+				store = state.NewMemoryStore(time.Now)
+			} else {
+				natsURL, stopNATS := startLocalNATSServer(b)
+				defer stopNATS()
+
+				tickBucket := "tick_bench_ingest_" + metric.Name
+				dataBucket := "data_bench_ingest_" + metric.Name
+				ensureStateBuckets(b, natsURL, tickBucket, dataBucket)
+
+				natsStore, err := state.NewNATSStore(config.NATSStateConfig{
+					URL:                []string{natsURL},
+					TickBucket:         tickBucket,
+					DataBucket:         dataBucket,
+					AllowCreateBuckets: true,
+				})
+				if err != nil {
+					b.Fatalf("new nats store: %v", err)
+				}
+				store = natsStore
+				defer func() {
+					_ = natsStore.Close()
+				}()
 			}
-			defer func() {
-				_ = store.Close()
-			}()
+
 			dispatcher := notify.NewDispatcher(config.NotifyConfig{}, logger)
 			manager := app.NewManager(cfg, logger, store, dispatcher, clock.RealClock{})
 			sink := &countingSink{manager: manager}
@@ -113,13 +129,7 @@ func BenchmarkHTTPBatchIngestThroughput(b *testing.B) {
 	for _, metric := range allE2EMetricCases() {
 		metric := metric
 		b.Run(metric.Name, func(b *testing.B) {
-			natsURL, stopNATS := startLocalNATSServer(b)
-			defer stopNATS()
-
-			tickBucket := "tick_bench_http_batch_" + metric.Name
-			dataBucket := "data_bench_http_batch_" + metric.Name
-			ensureStateBuckets(b, natsURL, tickBucket, dataBucket)
-
+			mode := benchmarkServiceMode()
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 			cfg := config.Config{
 				Notify: config.NotifyConfig{
@@ -134,18 +144,32 @@ func BenchmarkHTTPBatchIngestThroughput(b *testing.B) {
 				},
 			}
 
-			store, err := state.NewNATSStore(config.NATSStateConfig{
-				URL:                []string{natsURL},
-				TickBucket:         tickBucket,
-				DataBucket:         dataBucket,
-				AllowCreateBuckets: true,
-			})
-			if err != nil {
-				b.Fatalf("new nats store: %v", err)
+			var store state.Store
+			if mode == "single" {
+				store = state.NewMemoryStore(time.Now)
+			} else {
+				natsURL, stopNATS := startLocalNATSServer(b)
+				defer stopNATS()
+
+				tickBucket := "tick_bench_http_batch_" + metric.Name
+				dataBucket := "data_bench_http_batch_" + metric.Name
+				ensureStateBuckets(b, natsURL, tickBucket, dataBucket)
+
+				natsStore, err := state.NewNATSStore(config.NATSStateConfig{
+					URL:                []string{natsURL},
+					TickBucket:         tickBucket,
+					DataBucket:         dataBucket,
+					AllowCreateBuckets: true,
+				})
+				if err != nil {
+					b.Fatalf("new nats store: %v", err)
+				}
+				store = natsStore
+				defer func() {
+					_ = natsStore.Close()
+				}()
 			}
-			defer func() {
-				_ = store.Close()
-			}()
+
 			dispatcher := notify.NewDispatcher(config.NotifyConfig{}, logger)
 			manager := app.NewManager(cfg, logger, store, dispatcher, clock.RealClock{})
 			sink := &countingSink{manager: manager}

@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -195,7 +196,7 @@ func (s *NATSStore) UpdateCard(_ context.Context, alertID string, expectedRevisi
 	}
 	rev, err := s.dataKV.Update(alertID, body, expectedRevision)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "wrong last sequence") {
+		if errors.Is(err, nats.ErrKeyExists) || strings.Contains(strings.ToLower(err.Error()), "wrong last sequence") {
 			return 0, ErrConflict
 		}
 		return 0, fmt.Errorf("update card: %w", err)
@@ -222,7 +223,7 @@ func (s *NATSStore) DeleteCard(_ context.Context, alertID string) error {
 func (s *NATSStore) ListAlertIDsByRule(_ context.Context, ruleName string) ([]string, error) {
 	keys, err := s.dataKV.Keys()
 	if err != nil {
-		if strings.Contains(err.Error(), "no keys") {
+		if errors.Is(err, nats.ErrNoKeysFound) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("list keys: %w", err)
@@ -230,7 +231,7 @@ func (s *NATSStore) ListAlertIDsByRule(_ context.Context, ruleName string) ([]st
 	prefix := "rule/" + strings.ToLower(strings.TrimSpace(ruleName)) + "/"
 	ids := make([]string, 0)
 	for _, key := range keys {
-		if strings.HasPrefix(strings.ToLower(key), prefix) {
+		if strings.HasPrefix(key, prefix) {
 			ids = append(ids, key)
 		}
 	}

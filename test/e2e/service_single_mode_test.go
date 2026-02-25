@@ -2,15 +2,13 @@ package e2e
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
-func TestServiceSmokeHealthReadyAndIngest(t *testing.T) {
+func TestServiceSingleModeHTTPOnly(t *testing.T) {
 	for _, metric := range allE2EMetricCases() {
 		metric := metric
 		t.Run(metric.Name, func(t *testing.T) {
@@ -18,10 +16,8 @@ func TestServiceSmokeHealthReadyAndIngest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("free port: %v", err)
 			}
-			natsURL, stopNATS := startLocalNATSServer(t)
-			defer stopNATS()
 
-			ruleName := "smoke_" + metric.Name
+			ruleName := "single_" + metric.Name
 			options := defaultE2ERuleOptions(metric)
 			switch metric.AlertType {
 			case "count_total":
@@ -37,13 +33,13 @@ func TestServiceSmokeHealthReadyAndIngest(t *testing.T) {
 
 			tmpDir := t.TempDir()
 			configPath := filepath.Join(tmpDir, "config.toml")
-			cfg := e2eConfigPrefixWithMode(port, natsURL, e2eNotifyOptions{
+			cfg := e2eConfigPrefixWithMode(port, "", e2eNotifyOptions{
 				Repeat:           true,
 				RepeatEverySec:   300,
 				RepeatOn:         "firing",
 				RepeatPerChannel: true,
 				OnPending:        false,
-			}, "")
+			}, "single")
 			cfg += e2eHTTPNotifyConfig("http://127.0.0.1:1/notify")
 			cfg += buildRuleTOML(ruleName, metric, e2eMetricVar, options, fmt.Sprintf(`
 [[rule.%[1]s.notify.route]]
@@ -71,30 +67,10 @@ template = "http_default"
 			}
 			_ = resp.Body.Close()
 
-			postMetricEvent(t, baseURL, e2eMetricVar, "smoke-h1")
+			postMetricEvent(t, baseURL, e2eMetricVar, "single-h1")
 
 			cancel()
 			waitServiceStop(t, done)
 		})
 	}
-}
-
-func freePort() (int, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer listener.Close()
-	return listener.Addr().(*net.TCPAddr).Port, nil
-}
-
-func waitFor(t *testing.T, timeout time.Duration, check func() bool) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if check() {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("timeout waiting for condition")
 }

@@ -55,7 +55,7 @@ func NewService(source config.ConfigSource, clk clock.Clock) (*Service, error) {
 		return nil, err
 	}
 
-	store, err := buildStore(cfg)
+	store, err := buildStore(cfg, clk)
 	if err != nil {
 		closeLog()
 		return nil, err
@@ -119,7 +119,7 @@ func (s *Service) Run(ctx context.Context) error {
 			case <-shutdownCtx.Done():
 				return
 			case <-ticker.C:
-				if err := s.manager.Tick(context.Background()); err != nil {
+				if err := s.manager.Tick(shutdownCtx); err != nil && !errors.Is(err, context.Canceled) {
 					s.logger.Error("tick processing failed", "error", err.Error())
 				}
 			}
@@ -136,7 +136,7 @@ func (s *Service) Run(ctx context.Context) error {
 				case <-shutdownCtx.Done():
 					return
 				case <-reloadTicker.C:
-					if err := s.reloadConfig(context.Background()); err != nil {
+					if err := s.reloadConfig(shutdownCtx); err != nil && !errors.Is(err, context.Canceled) {
 						s.logger.Error("reload failed", "error", err.Error())
 					}
 				}
@@ -168,37 +168,49 @@ func (s *Service) shutdown() error {
 	s.readyFlag.Store(false)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	var firstErr error
+	markErr := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 
 	if err := s.httpSrv.Shutdown(ctx); err != nil {
 		s.logger.Error("http shutdown failed", "error", err.Error())
+		markErr(fmt.Errorf("http shutdown: %w", err))
 	}
 	if s.natsSub != nil {
 		if err := s.natsSub.Close(); err != nil {
 			s.logger.Error("nats subscriber close failed", "error", err.Error())
+			markErr(fmt.Errorf("nats subscriber close: %w", err))
 		}
 	}
 	if s.deleteSub != nil {
 		if err := s.deleteSub.Close(); err != nil {
 			s.logger.Error("delete-marker consumer close failed", "error", err.Error())
+			markErr(fmt.Errorf("delete-marker consumer close: %w", err))
 		}
 	}
 	if s.notifyQ != nil {
 		if err := s.notifyQ.Close(); err != nil {
 			s.logger.Error("notify queue worker close failed", "error", err.Error())
+			markErr(fmt.Errorf("notify queue worker close: %w", err))
 		}
 	}
 	if s.notifyPub != nil {
 		if err := s.notifyPub.Close(); err != nil {
 			s.logger.Error("notify queue producer close failed", "error", err.Error())
+			markErr(fmt.Errorf("notify queue producer close: %w", err))
 		}
 	}
 	if err := s.store.Close(); err != nil {
 		s.logger.Error("store close failed", "error", err.Error())
+		markErr(fmt.Errorf("store close: %w", err))
 	}
 	if s.closeLog != nil {
 		s.closeLog()
 	}
-	return nil
+	return firstErr
 }
 
 // cleanupInitResources closes partially initialized resources on startup failures.
@@ -275,6 +287,9 @@ func (s *Service) buildHTTPServer() error {
 // Params: none.
 // Returns: initialization error.
 func (s *Service) buildNATSSubscriber() error {
+	if isSingleMode(s.cfg) {
+		return nil
+	}
 	if !s.cfg.Ingest.NATS.Enabled {
 		return nil
 	}
@@ -290,6 +305,9 @@ func (s *Service) buildNATSSubscriber() error {
 // Params: none.
 // Returns: initialization error when consumer cannot be started.
 func (s *Service) buildDeleteConsumer() error {
+	if isSingleMode(s.cfg) {
+		return nil
+	}
 	stateCfg := config.DeriveStateNATSConfig(s.cfg)
 	consumer, err := state.NewDeleteMarkerConsumer(stateCfg, func(ctx context.Context, alertID, reason string) error {
 		if err := s.manager.ResolveByTTL(ctx, alertID, reason); err != nil {
@@ -312,6 +330,9 @@ func (s *Service) reloadConfig(ctx context.Context) error {
 	nextCfg, err := config.LoadSnapshot(s.source)
 	if err != nil {
 		return err
+	}
+	if isSingleMode(nextCfg) != isSingleMode(s.cfg) {
+		return fmt.Errorf("service.mode change requires restart")
 	}
 	nextDispatcher := notify.NewDispatcher(nextCfg.Notify, s.logger)
 	nextProducer, nextWorker, err := s.buildNotifyQueueRuntime(nextCfg)
@@ -360,6 +381,9 @@ func (s *Service) buildNotifyQueue() error {
 // Params: config snapshot.
 // Returns: producer and worker handles (nil when queue disabled).
 func (s *Service) buildNotifyQueueRuntime(cfg config.Config) (notifyqueue.Producer, interface{ Close() error }, error) {
+	if isSingleMode(cfg) {
+		return nil, nil, nil
+	}
 	if !cfg.Notify.Queue.Enabled {
 		return nil, nil, nil
 	}
@@ -380,6 +404,13 @@ func (s *Service) buildNotifyQueueRuntime(cfg config.Config) (notifyqueue.Produc
 // buildStore creates runtime state backend from config.
 // Params: root config snapshot.
 // Returns: selected store backend.
-func buildStore(cfg config.Config) (state.Store, error) {
+func buildStore(cfg config.Config, clk clock.Clock) (state.Store, error) {
+	if isSingleMode(cfg) {
+		return state.NewMemoryStore(clk.Now), nil
+	}
 	return state.NewNATSStore(config.DeriveStateNATSConfig(cfg))
+}
+
+func isSingleMode(cfg config.Config) bool {
+	return config.NormalizeServiceMode(cfg.Service.Mode) == config.ServiceModeSingle
 }

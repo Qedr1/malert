@@ -16,33 +16,33 @@ import (
 )
 
 const (
-	defaultHTTPListen            = ":8080"
-	defaultHealthPath            = "/healthz"
-	defaultReadyPath             = "/readyz"
-	defaultIngestPath            = "/ingest"
-	defaultNATSSubject           = "alerting.events"
-	defaultNATSIngestStream      = "ALERTING_EVENTS"
-	defaultNATSIngestConsumer    = "alerting-ingest"
-	defaultNATSIngestGroup       = "alerting-workers"
-	defaultNATSAckWaitSec        = 30
-	defaultNATSNackDelayMS       = 1000
-	defaultNATSMaxDeliver        = -1
-	defaultNATSMaxAckPending     = 2048
-	defaultNATSURL               = "nats://127.0.0.1:4222"
-	defaultNATSTickBucket        = "tick"
-	defaultNATSDataBucket        = "data"
-	defaultNotifyQueueSubject    = "alerting.notify.jobs"
-	defaultNotifyQueueStream     = "ALERTING_NOTIFY"
-	defaultNotifyQueueDLQSubject = "alerting.notify.jobs.dlq"
-	defaultNotifyQueueDLQStream  = "ALERTING_NOTIFY_DLQ"
-	defaultNotifyQueueConsumer   = "alerting-notify"
-	defaultNotifyQueueGroup      = "alerting-notify-workers"
-	defaultDeleteConsumer        = "alerting-resolve"
-	defaultDeleteDeliver         = "alerting-resolve"
-	defaultReloadSeconds         = 5
-	defaultResolveScanSeconds    = 1
-	defaultNotifyRepeatSeconds   = 300
-	defaultPendingDelaySeconds   = 300
+	defaultHTTPListen          = ":8080"
+	defaultHealthPath          = "/healthz"
+	defaultReadyPath           = "/readyz"
+	defaultIngestPath          = "/ingest"
+	defaultNATSSubject         = "alerting.events"
+	defaultNATSIngestStream    = "ALERTING_EVENTS"
+	defaultNATSIngestConsumer  = "alerting-ingest"
+	defaultNATSIngestGroup     = "alerting-workers"
+	defaultNATSIngestWorkers   = 1
+	defaultNATSAckWaitSec      = 30
+	defaultNATSNackDelayMS     = 1000
+	defaultNATSMaxDeliver      = -1
+	defaultNATSMaxAckPending   = 2048
+	defaultNATSURL             = "nats://127.0.0.1:4222"
+	defaultNATSTickBucket      = "tick"
+	defaultNATSDataBucket      = "data"
+	defaultDeleteConsumer      = "alerting-resolve"
+	defaultDeleteDeliver       = "alerting-resolve"
+	defaultReloadSeconds       = 5
+	defaultResolveScanSeconds  = 1
+	defaultNotifyRepeatSeconds = 300
+	defaultPendingDelaySeconds = 300
+
+	// ServiceModeNATS keeps NATS-backed state/ingest settings.
+	ServiceModeNATS = "nats"
+	// ServiceModeSingle keeps single-instance mode without NATS dependencies.
+	ServiceModeSingle = "single"
 
 	// NotifyChannelTelegram identifies Telegram transport.
 	NotifyChannelTelegram = "telegram"
@@ -128,8 +128,11 @@ var (
 			"!=": {},
 		},
 	}
-	legacyRuleArrayPattern  = regexp.MustCompile(`(?m)^\s*\[\[\s*rule\s*\]\]`)
-	unsupportedStatePattern = regexp.MustCompile(`(?m)^\s*\[\[?\s*state(?:\.[^\]\s]+)*\s*\]\]?`)
+	legacyRuleArrayPattern                = regexp.MustCompile(`(?m)^\s*\[\[\s*rule\s*\]\]`)
+	unsupportedStatePattern               = regexp.MustCompile(`(?m)^\s*\[\[?\s*state(?:\.[^\]\s]+)*\s*\]\]?`)
+	unsupportedIngestNATSFixedKeysPattern = regexp.MustCompile(`(?mi)^\s*(?:subject|stream|consumer_name|deliver_group)\s*=`)
+	unsupportedNotifyQueueURLPattern      = regexp.MustCompile(`(?si)\[\s*notify\.queue\s*\][^\[]*\burl\s*=`)
+	unsupportedNotifyQueueDLQTablePattern = regexp.MustCompile(`(?mi)^\s*\[\s*notify\.queue\.dlq\s*\]`)
 )
 
 // notifyChannelDescriptor stores generic accessors for one notify transport.
@@ -183,6 +186,7 @@ type rawRuleConfig struct {
 // Returns: service behavior defaults.
 type ServiceConfig struct {
 	Name                string `toml:"name"`
+	Mode                string `toml:"mode"`
 	ReloadEnabled       bool   `toml:"reload_enabled"`
 	ReloadIntervalSec   int    `toml:"reload_interval_sec"`
 	ResolveScanInterval int    `toml:"resolve_scan_interval_sec"`
@@ -211,15 +215,16 @@ type HTTPIngestConfig struct {
 }
 
 // NATSIngestConfig configures JetStream queue-consumer ingestion.
-// Params: connection, stream/subject binding, consumer group, and ack/redelivery policy.
+// Params: connection + worker/ack/redelivery policy; stream routing keys are runtime-fixed.
 // Returns: NATS ingest behavior.
 type NATSIngestConfig struct {
 	Enabled       bool     `toml:"enabled"`
 	URL           []string `toml:"url"`
-	Subject       string   `toml:"subject"`
-	Stream        string   `toml:"stream"`
-	ConsumerName  string   `toml:"consumer_name"`
-	DeliverGroup  string   `toml:"deliver_group"`
+	Subject       string   `toml:"-"`
+	Stream        string   `toml:"-"`
+	ConsumerName  string   `toml:"-"`
+	DeliverGroup  string   `toml:"-"`
+	Workers       int      `toml:"workers"`
 	AckWaitSec    int      `toml:"ack_wait_sec"`
 	NackDelayMS   int      `toml:"nack_delay_ms"`
 	MaxDeliver    int      `toml:"max_deliver"`
@@ -279,29 +284,16 @@ type NotifyConfig struct {
 }
 
 // NotifyQueue defines asynchronous delivery queue settings.
-// Params: NATS stream/consumer options for notification jobs.
+// Params: enable flag, worker/ack policy, and optional fixed DLQ toggle.
 // Returns: async notify pipeline controls.
 type NotifyQueue struct {
-	Enabled       bool           `toml:"enabled"`
-	URL           string         `toml:"url"`
-	Subject       string         `toml:"subject"`
-	Stream        string         `toml:"stream"`
-	ConsumerName  string         `toml:"consumer_name"`
-	DeliverGroup  string         `toml:"deliver_group"`
-	AckWaitSec    int            `toml:"ack_wait_sec"`
-	NackDelayMS   int            `toml:"nack_delay_ms"`
-	MaxDeliver    int            `toml:"max_deliver"`
-	MaxAckPending int            `toml:"max_ack_pending"`
-	DLQ           NotifyQueueDLQ `toml:"dlq"`
-}
-
-// NotifyQueueDLQ defines dead-letter queue settings for dropped notify jobs.
-// Params: enable flag and destination subject/stream.
-// Returns: DLQ controls for notify queue worker.
-type NotifyQueueDLQ struct {
-	Enabled bool   `toml:"enabled"`
-	Subject string `toml:"subject"`
-	Stream  string `toml:"stream"`
+	Enabled       bool     `toml:"enabled"`
+	URL           []string `toml:"-"`
+	AckWaitSec    int      `toml:"ack_wait_sec"`
+	NackDelayMS   int      `toml:"nack_delay_ms"`
+	MaxDeliver    int      `toml:"max_deliver"`
+	MaxAckPending int      `toml:"max_ack_pending"`
+	DLQ           bool     `toml:"dlq"`
 }
 
 // NamedTemplateConfig describes one reusable message template within one channel section.
@@ -637,8 +629,8 @@ type notifyMergeHints struct {
 // Params: sparse queue fields decoded from one TOML fragment.
 // Returns: bool-presence markers for queue merge logic.
 type queueMergeHints struct {
-	Enabled *bool             `toml:"enabled"`
-	DLQ     channelMergeHints `toml:"dlq"`
+	Enabled *bool `toml:"enabled"`
+	DLQ     *bool `toml:"dlq"`
 }
 
 // channelMergeHints tracks explicit enabled flags in channel sections.
@@ -656,7 +648,7 @@ func (h notifyMergeHints) hasExplicitBool() bool {
 		h.RepeatPerChannel != nil ||
 		h.OnPending != nil ||
 		h.Queue.Enabled != nil ||
-		h.Queue.DLQ.Enabled != nil ||
+		h.Queue.DLQ != nil ||
 		h.Telegram.Enabled != nil ||
 		h.HTTP.Enabled != nil ||
 		h.Mattermost.Enabled != nil ||
@@ -714,6 +706,15 @@ func rejectUnsupportedSyntax(body []byte) error {
 	}
 	if unsupportedStatePattern.Match(body) {
 		return errors.New("state configuration is not supported; state backend settings are fixed and derived from ingest.nats.url")
+	}
+	if unsupportedIngestNATSFixedKeysPattern.Match(body) {
+		return errors.New("ingest.nats.subject/stream/consumer_name/deliver_group are fixed in runtime and must not be configured")
+	}
+	if unsupportedNotifyQueueURLPattern.Match(body) {
+		return errors.New("notify.queue.url is not supported; notify queue NATS URL is derived from ingest.nats.url")
+	}
+	if unsupportedNotifyQueueDLQTablePattern.Match(body) {
+		return errors.New("[notify.queue.dlq] section is not supported; use notify.queue.dlq = true|false in [notify.queue]")
 	}
 	return nil
 }
@@ -850,21 +851,6 @@ func mergeNotifyConfig(dst *NotifyConfig, src NotifyConfig, hints notifyMergeHin
 // Returns: merged queue config side-effect in dst.
 func mergeNotifyQueue(dst *NotifyQueue, src NotifyQueue, hints queueMergeHints) {
 	applyBoolMerge(&dst.Enabled, src.Enabled, hints.Enabled)
-	if strings.TrimSpace(src.URL) != "" {
-		dst.URL = src.URL
-	}
-	if strings.TrimSpace(src.Subject) != "" {
-		dst.Subject = src.Subject
-	}
-	if strings.TrimSpace(src.Stream) != "" {
-		dst.Stream = src.Stream
-	}
-	if strings.TrimSpace(src.ConsumerName) != "" {
-		dst.ConsumerName = src.ConsumerName
-	}
-	if strings.TrimSpace(src.DeliverGroup) != "" {
-		dst.DeliverGroup = src.DeliverGroup
-	}
 	if src.AckWaitSec != 0 {
 		dst.AckWaitSec = src.AckWaitSec
 	}
@@ -877,13 +863,7 @@ func mergeNotifyQueue(dst *NotifyQueue, src NotifyQueue, hints queueMergeHints) 
 	if src.MaxAckPending != 0 {
 		dst.MaxAckPending = src.MaxAckPending
 	}
-	applyBoolMerge(&dst.DLQ.Enabled, src.DLQ.Enabled, hints.DLQ.Enabled)
-	if strings.TrimSpace(src.DLQ.Subject) != "" {
-		dst.DLQ.Subject = src.DLQ.Subject
-	}
-	if strings.TrimSpace(src.DLQ.Stream) != "" {
-		dst.DLQ.Stream = src.DLQ.Stream
-	}
+	applyBoolMerge(&dst.DLQ, src.DLQ, hints.DLQ)
 }
 
 // mergeTelegramNotifier overlays telegram transport config preserving other notify fields.
@@ -1043,18 +1023,11 @@ func hasNotifyConfig(cfg NotifyConfig) bool {
 		return true
 	}
 	if cfg.Queue.Enabled ||
-		strings.TrimSpace(cfg.Queue.URL) != "" ||
-		strings.TrimSpace(cfg.Queue.Subject) != "" ||
-		strings.TrimSpace(cfg.Queue.Stream) != "" ||
-		strings.TrimSpace(cfg.Queue.ConsumerName) != "" ||
-		strings.TrimSpace(cfg.Queue.DeliverGroup) != "" ||
 		cfg.Queue.AckWaitSec != 0 ||
 		cfg.Queue.NackDelayMS != 0 ||
 		cfg.Queue.MaxDeliver != 0 ||
 		cfg.Queue.MaxAckPending != 0 ||
-		cfg.Queue.DLQ.Enabled ||
-		strings.TrimSpace(cfg.Queue.DLQ.Subject) != "" ||
-		strings.TrimSpace(cfg.Queue.DLQ.Stream) != "" {
+		cfg.Queue.DLQ {
 		return true
 	}
 	if cfg.Telegram.Enabled ||
@@ -1114,6 +1087,7 @@ func applyDefaults(cfg *Config) {
 	if strings.TrimSpace(cfg.Service.Name) == "" {
 		cfg.Service.Name = "alerting"
 	}
+	cfg.Service.Mode = NormalizeServiceMode(cfg.Service.Mode)
 	if cfg.Service.ReloadIntervalSec <= 0 {
 		cfg.Service.ReloadIntervalSec = defaultReloadSeconds
 	}
@@ -1152,39 +1126,41 @@ func applyDefaults(cfg *Config) {
 	if cfg.Ingest.HTTP.MaxBodyBytes <= 0 {
 		cfg.Ingest.HTTP.MaxBodyBytes = 2 << 20
 	}
-	cfg.Ingest.NATS.URL = normalizeNATSURLs(cfg.Ingest.NATS.URL)
-	if len(cfg.Ingest.NATS.URL) == 0 {
-		cfg.Ingest.NATS.URL = []string{defaultNATSURL}
-	}
-	if cfg.Ingest.NATS.Subject == "" {
+	if cfg.Service.Mode == ServiceModeSingle {
+		// Single mode always disables NATS-dependent paths regardless of user flags.
+		cfg.Ingest.NATS.Enabled = false
+		cfg.Notify.Queue.Enabled = false
+		cfg.Notify.Queue.DLQ = false
+	} else {
+		cfg.Ingest.NATS.URL = normalizeNATSURLs(cfg.Ingest.NATS.URL)
+		if len(cfg.Ingest.NATS.URL) == 0 {
+			cfg.Ingest.NATS.URL = []string{defaultNATSURL}
+		}
 		cfg.Ingest.NATS.Subject = defaultNATSSubject
-	}
-	if cfg.Ingest.NATS.Stream == "" {
 		cfg.Ingest.NATS.Stream = defaultNATSIngestStream
-	}
-	if cfg.Ingest.NATS.ConsumerName == "" {
 		cfg.Ingest.NATS.ConsumerName = defaultNATSIngestConsumer
-	}
-	if cfg.Ingest.NATS.DeliverGroup == "" {
 		cfg.Ingest.NATS.DeliverGroup = defaultNATSIngestGroup
-	}
-	if cfg.Ingest.NATS.AckWaitSec <= 0 {
-		cfg.Ingest.NATS.AckWaitSec = defaultNATSAckWaitSec
-	}
-	if cfg.Ingest.NATS.NackDelayMS < 0 {
-		cfg.Ingest.NATS.NackDelayMS = 0
-	}
-	if cfg.Ingest.NATS.NackDelayMS == 0 {
-		cfg.Ingest.NATS.NackDelayMS = defaultNATSNackDelayMS
-	}
-	if cfg.Ingest.NATS.MaxDeliver == 0 {
-		cfg.Ingest.NATS.MaxDeliver = defaultNATSMaxDeliver
-	}
-	if cfg.Ingest.NATS.MaxAckPending <= 0 {
-		cfg.Ingest.NATS.MaxAckPending = defaultNATSMaxAckPending
-	}
-	if !cfg.Ingest.HTTP.Enabled && !cfg.Ingest.NATS.Enabled {
-		cfg.Ingest.HTTP.Enabled = true
+		if cfg.Ingest.NATS.Workers == 0 {
+			cfg.Ingest.NATS.Workers = defaultNATSIngestWorkers
+		}
+		if cfg.Ingest.NATS.AckWaitSec <= 0 {
+			cfg.Ingest.NATS.AckWaitSec = defaultNATSAckWaitSec
+		}
+		if cfg.Ingest.NATS.NackDelayMS < 0 {
+			cfg.Ingest.NATS.NackDelayMS = 0
+		}
+		if cfg.Ingest.NATS.NackDelayMS == 0 {
+			cfg.Ingest.NATS.NackDelayMS = defaultNATSNackDelayMS
+		}
+		if cfg.Ingest.NATS.MaxDeliver == 0 {
+			cfg.Ingest.NATS.MaxDeliver = defaultNATSMaxDeliver
+		}
+		if cfg.Ingest.NATS.MaxAckPending <= 0 {
+			cfg.Ingest.NATS.MaxAckPending = defaultNATSMaxAckPending
+		}
+		if !cfg.Ingest.HTTP.Enabled && !cfg.Ingest.NATS.Enabled {
+			cfg.Ingest.HTTP.Enabled = true
+		}
 	}
 
 	if cfg.Notify.RepeatEverySec <= 0 {
@@ -1193,41 +1169,26 @@ func applyDefaults(cfg *Config) {
 	if len(cfg.Notify.RepeatOn) == 0 {
 		cfg.Notify.RepeatOn = []string{"firing"}
 	}
-	if cfg.Notify.Queue.URL == "" {
-		cfg.Notify.Queue.URL = defaultNATSURL
-	}
-	if cfg.Notify.Queue.Subject == "" {
-		cfg.Notify.Queue.Subject = defaultNotifyQueueSubject
-	}
-	if cfg.Notify.Queue.Stream == "" {
-		cfg.Notify.Queue.Stream = defaultNotifyQueueStream
-	}
-	if cfg.Notify.Queue.ConsumerName == "" {
-		cfg.Notify.Queue.ConsumerName = defaultNotifyQueueConsumer
-	}
-	if cfg.Notify.Queue.DeliverGroup == "" {
-		cfg.Notify.Queue.DeliverGroup = defaultNotifyQueueGroup
-	}
-	if cfg.Notify.Queue.AckWaitSec <= 0 {
-		cfg.Notify.Queue.AckWaitSec = defaultNATSAckWaitSec
-	}
-	if cfg.Notify.Queue.NackDelayMS < 0 {
-		cfg.Notify.Queue.NackDelayMS = 0
-	}
-	if cfg.Notify.Queue.NackDelayMS == 0 {
-		cfg.Notify.Queue.NackDelayMS = defaultNATSNackDelayMS
-	}
-	if cfg.Notify.Queue.MaxDeliver == 0 {
-		cfg.Notify.Queue.MaxDeliver = defaultNATSMaxDeliver
-	}
-	if cfg.Notify.Queue.MaxAckPending <= 0 {
-		cfg.Notify.Queue.MaxAckPending = defaultNATSMaxAckPending
-	}
-	if cfg.Notify.Queue.DLQ.Subject == "" {
-		cfg.Notify.Queue.DLQ.Subject = defaultNotifyQueueDLQSubject
-	}
-	if cfg.Notify.Queue.DLQ.Stream == "" {
-		cfg.Notify.Queue.DLQ.Stream = defaultNotifyQueueDLQStream
+	if cfg.Service.Mode == ServiceModeNATS {
+		// Queue uses the same NATS URL list as ingest/state in multi-instance mode.
+		cfg.Notify.Queue.URL = append([]string(nil), cfg.Ingest.NATS.URL...)
+		if cfg.Notify.Queue.AckWaitSec <= 0 {
+			cfg.Notify.Queue.AckWaitSec = defaultNATSAckWaitSec
+		}
+		if cfg.Notify.Queue.NackDelayMS < 0 {
+			cfg.Notify.Queue.NackDelayMS = 0
+		}
+		if cfg.Notify.Queue.NackDelayMS == 0 {
+			cfg.Notify.Queue.NackDelayMS = defaultNATSNackDelayMS
+		}
+		if cfg.Notify.Queue.MaxDeliver == 0 {
+			cfg.Notify.Queue.MaxDeliver = defaultNATSMaxDeliver
+		}
+		if cfg.Notify.Queue.MaxAckPending <= 0 {
+			cfg.Notify.Queue.MaxAckPending = defaultNATSMaxAckPending
+		}
+	} else {
+		cfg.Notify.Queue.URL = nil
 	}
 	if cfg.Notify.Telegram.APIBase == "" {
 		cfg.Notify.Telegram.APIBase = "https://api.telegram.org"
@@ -1317,6 +1278,10 @@ func validateConfig(cfg Config) error {
 	if len(cfg.Rule) == 0 {
 		return errors.New("at least one rule is required")
 	}
+	mode := NormalizeServiceMode(cfg.Service.Mode)
+	if !IsSupportedServiceMode(mode) {
+		return fmt.Errorf("service.mode has unsupported value %q", cfg.Service.Mode)
+	}
 	if cfg.Service.RuntimeStateIdleSec < 0 {
 		return errors.New("service.runtime_state_idle_sec must be >=0")
 	}
@@ -1335,38 +1300,36 @@ func validateConfig(cfg Config) error {
 	if strings.TrimSpace(cfg.Ingest.HTTP.IngestPath) == "" {
 		return errors.New("ingest.http.ingest_path is required")
 	}
-	if len(cfg.Ingest.NATS.URL) == 0 {
-		return errors.New("ingest.nats.url is required")
-	}
-	for i, url := range cfg.Ingest.NATS.URL {
-		if strings.TrimSpace(url) == "" {
-			return fmt.Errorf("ingest.nats.url[%d] is empty", i)
+	if mode == ServiceModeSingle {
+		if !cfg.Ingest.HTTP.Enabled {
+			return errors.New("ingest.http.enabled must be true when service.mode=single")
 		}
 	}
-	if cfg.Ingest.NATS.Enabled {
-		if strings.TrimSpace(cfg.Ingest.NATS.Subject) == "" {
-			return errors.New("ingest.nats.subject is required when ingest.nats.enabled=true")
+	if mode == ServiceModeNATS {
+		if len(cfg.Ingest.NATS.URL) == 0 {
+			return errors.New("ingest.nats.url is required")
 		}
-		if strings.TrimSpace(cfg.Ingest.NATS.Stream) == "" {
-			return errors.New("ingest.nats.stream is required when ingest.nats.enabled=true")
+		for i, url := range cfg.Ingest.NATS.URL {
+			if strings.TrimSpace(url) == "" {
+				return fmt.Errorf("ingest.nats.url[%d] is empty", i)
+			}
 		}
-		if strings.TrimSpace(cfg.Ingest.NATS.ConsumerName) == "" {
-			return errors.New("ingest.nats.consumer_name is required when ingest.nats.enabled=true")
-		}
-		if strings.TrimSpace(cfg.Ingest.NATS.DeliverGroup) == "" {
-			return errors.New("ingest.nats.deliver_group is required when ingest.nats.enabled=true")
-		}
-		if cfg.Ingest.NATS.AckWaitSec <= 0 {
-			return errors.New("ingest.nats.ack_wait_sec must be >0 when ingest.nats.enabled=true")
-		}
-		if cfg.Ingest.NATS.NackDelayMS < 0 {
-			return errors.New("ingest.nats.nack_delay_ms must be >=0")
-		}
-		if cfg.Ingest.NATS.MaxDeliver == 0 || cfg.Ingest.NATS.MaxDeliver < -1 {
-			return errors.New("ingest.nats.max_deliver must be -1 or >0")
-		}
-		if cfg.Ingest.NATS.MaxAckPending <= 0 {
-			return errors.New("ingest.nats.max_ack_pending must be >0 when ingest.nats.enabled=true")
+		if cfg.Ingest.NATS.Enabled {
+			if cfg.Ingest.NATS.Workers <= 0 {
+				return errors.New("ingest.nats.workers must be >0 when ingest.nats.enabled=true")
+			}
+			if cfg.Ingest.NATS.AckWaitSec <= 0 {
+				return errors.New("ingest.nats.ack_wait_sec must be >0 when ingest.nats.enabled=true")
+			}
+			if cfg.Ingest.NATS.NackDelayMS < 0 {
+				return errors.New("ingest.nats.nack_delay_ms must be >=0")
+			}
+			if cfg.Ingest.NATS.MaxDeliver == 0 || cfg.Ingest.NATS.MaxDeliver < -1 {
+				return errors.New("ingest.nats.max_deliver must be -1 or >0")
+			}
+			if cfg.Ingest.NATS.MaxAckPending <= 0 {
+				return errors.New("ingest.nats.max_ack_pending must be >0 when ingest.nats.enabled=true")
+			}
 		}
 	}
 
@@ -1389,21 +1352,6 @@ func validateConfig(cfg Config) error {
 		return errors.New("notify.http.url is required when notify.http.enabled=true")
 	}
 	if cfg.Notify.Queue.Enabled {
-		if strings.TrimSpace(cfg.Notify.Queue.URL) == "" {
-			return errors.New("notify.queue.url is required when notify.queue.enabled=true")
-		}
-		if strings.TrimSpace(cfg.Notify.Queue.Subject) == "" {
-			return errors.New("notify.queue.subject is required when notify.queue.enabled=true")
-		}
-		if strings.TrimSpace(cfg.Notify.Queue.Stream) == "" {
-			return errors.New("notify.queue.stream is required when notify.queue.enabled=true")
-		}
-		if strings.TrimSpace(cfg.Notify.Queue.ConsumerName) == "" {
-			return errors.New("notify.queue.consumer_name is required when notify.queue.enabled=true")
-		}
-		if strings.TrimSpace(cfg.Notify.Queue.DeliverGroup) == "" {
-			return errors.New("notify.queue.deliver_group is required when notify.queue.enabled=true")
-		}
 		if cfg.Notify.Queue.AckWaitSec <= 0 {
 			return errors.New("notify.queue.ack_wait_sec must be >0 when notify.queue.enabled=true")
 		}
@@ -1417,18 +1365,9 @@ func validateConfig(cfg Config) error {
 			return errors.New("notify.queue.max_ack_pending must be >0 when notify.queue.enabled=true")
 		}
 	}
-	if cfg.Notify.Queue.DLQ.Enabled {
+	if cfg.Notify.Queue.DLQ {
 		if !cfg.Notify.Queue.Enabled {
-			return errors.New("notify.queue.dlq.enabled requires notify.queue.enabled=true")
-		}
-		if strings.TrimSpace(cfg.Notify.Queue.DLQ.Subject) == "" {
-			return errors.New("notify.queue.dlq.subject is required when notify.queue.dlq.enabled=true")
-		}
-		if strings.TrimSpace(cfg.Notify.Queue.DLQ.Stream) == "" {
-			return errors.New("notify.queue.dlq.stream is required when notify.queue.dlq.enabled=true")
-		}
-		if strings.TrimSpace(cfg.Notify.Queue.DLQ.Subject) == strings.TrimSpace(cfg.Notify.Queue.Subject) {
-			return errors.New("notify.queue.dlq.subject must differ from notify.queue.subject")
+			return errors.New("notify.queue.dlq requires notify.queue.enabled=true")
 		}
 	}
 	if cfg.Notify.Mattermost.Enabled && strings.TrimSpace(cfg.Notify.Mattermost.BaseURL) == "" {
@@ -1643,10 +1582,7 @@ func hasHTTPIngestConfig(cfg HTTPIngestConfig) bool {
 func hasNATSIngestConfig(cfg NATSIngestConfig) bool {
 	return cfg.Enabled ||
 		len(cfg.URL) > 0 ||
-		strings.TrimSpace(cfg.Subject) != "" ||
-		strings.TrimSpace(cfg.Stream) != "" ||
-		strings.TrimSpace(cfg.ConsumerName) != "" ||
-		strings.TrimSpace(cfg.DeliverGroup) != "" ||
+		cfg.Workers != 0 ||
 		cfg.AckWaitSec != 0 ||
 		cfg.NackDelayMS != 0 ||
 		cfg.MaxDeliver != 0 ||
@@ -1910,6 +1846,29 @@ func NormalizeNotifyRouteMode(value string) string {
 		return NotifyRouteModeHistory
 	}
 	return normalized
+}
+
+// NormalizeServiceMode canonicalizes service mode and applies default.
+// Params: raw mode value from config.
+// Returns: normalized mode (`nats` by default).
+func NormalizeServiceMode(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return ServiceModeNATS
+	}
+	return normalized
+}
+
+// IsSupportedServiceMode reports whether mode value is supported.
+// Params: normalized mode value.
+// Returns: true for known modes.
+func IsSupportedServiceMode(mode string) bool {
+	switch NormalizeServiceMode(mode) {
+	case ServiceModeNATS, ServiceModeSingle:
+		return true
+	default:
+		return false
+	}
 }
 
 // IsSupportedNotifyRouteMode reports whether route mode value is supported.

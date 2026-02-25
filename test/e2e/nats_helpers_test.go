@@ -79,3 +79,46 @@ func ensureStateBuckets(tb testing.TB, url, tickBucket, dataBucket string) {
 	}
 	_ = store.Close()
 }
+
+// cleanupBenchmarkNATSArtifacts removes benchmark stream and KV buckets.
+// Params: test handle, server URL, stream name, and KV buckets.
+// Returns: benchmark leaves no JetStream artifacts on successful teardown.
+func cleanupBenchmarkNATSArtifacts(tb testing.TB, url, streamName string, buckets ...string) {
+	tb.Helper()
+
+	nc, err := nats.Connect(url)
+	if err != nil {
+		tb.Fatalf("connect nats for cleanup: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	if err != nil {
+		tb.Fatalf("jetstream init for cleanup: %v", err)
+	}
+
+	for _, bucket := range buckets {
+		bucket = strings.TrimSpace(bucket)
+		if bucket == "" {
+			continue
+		}
+		if err := js.DeleteKeyValue(bucket); err != nil {
+			errText := strings.ToLower(err.Error())
+			if errors.Is(err, nats.ErrBucketNotFound) || strings.Contains(errText, "bucket not found") || strings.Contains(errText, "stream not found") {
+				continue
+			}
+			tb.Fatalf("delete kv bucket %q: %v", bucket, err)
+		}
+	}
+
+	streamName = strings.TrimSpace(streamName)
+	if streamName == "" {
+		return
+	}
+	if err := js.DeleteStream(streamName); err != nil {
+		if errors.Is(err, nats.ErrStreamNotFound) || strings.Contains(strings.ToLower(err.Error()), "stream not found") {
+			return
+		}
+		tb.Fatalf("delete stream %q: %v", streamName, err)
+	}
+}

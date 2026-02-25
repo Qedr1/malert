@@ -1,6 +1,9 @@
 package e2e
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // e2eNotifyOptions defines notify defaults embedded into e2e config prefixes.
 // Params: repeat flags and intervals.
@@ -30,6 +33,10 @@ func e2eStandardConfigPrefix(port int, natsURL string) string {
 // Params: HTTP port, NATS URL, and notify options.
 // Returns: TOML prefix string.
 func e2eConfigPrefix(port int, natsURL string, notify e2eNotifyOptions) string {
+	return e2eConfigPrefixWithMode(port, natsURL, notify, "")
+}
+
+func e2eConfigPrefixWithMode(port int, natsURL string, notify e2eNotifyOptions, mode string) string {
 	repeatEverySec := notify.RepeatEverySec
 	if repeatEverySec <= 0 {
 		repeatEverySec = 300
@@ -38,9 +45,23 @@ func e2eConfigPrefix(port int, natsURL string, notify e2eNotifyOptions) string {
 	if repeatOn == "" {
 		repeatOn = "firing"
 	}
+	modeLine := ""
+	normalizedMode := strings.ToLower(strings.TrimSpace(mode))
+	if normalizedMode != "" {
+		modeLine = fmt.Sprintf("mode = %q\n", normalizedMode)
+	}
+	natsBlock := ""
+	if normalizedMode == "" || normalizedMode == "nats" {
+		natsBlock = fmt.Sprintf(`
+[ingest.nats]
+enabled = false
+url = ["%s"]
+`, natsURL)
+	}
 	return fmt.Sprintf(`
 [service]
 name = "alerting"
+%s
 reload_enabled = false
 resolve_scan_interval_sec = 1
 
@@ -56,10 +77,7 @@ health_path = "/healthz"
 ready_path = "/readyz"
 ingest_path = "/ingest"
 max_body_bytes = 1048576
-
-[ingest.nats]
-enabled = false
-url = ["%s"]
+%s
 
 [notify]
 repeat = %t
@@ -67,5 +85,27 @@ repeat_every_sec = %d
 repeat_on = ["%s"]
 repeat_per_channel = %t
 on_pending = %t
-`, port, natsURL, notify.Repeat, repeatEverySec, repeatOn, notify.RepeatPerChannel, notify.OnPending)
+`, modeLine, port, natsBlock, notify.Repeat, repeatEverySec, repeatOn, notify.RepeatPerChannel, notify.OnPending)
+}
+
+func e2eHTTPNotifyConfig(url string) string {
+	return fmt.Sprintf(`
+[notify.http]
+enabled = true
+url = "%s"
+method = "POST"
+timeout_sec = 1
+
+[notify.http.retry]
+enabled = true
+backoff = "exponential"
+initial_ms = 1
+max_ms = 2
+max_attempts = 0
+log_each_attempt = true
+
+[[notify.http.name-template]]
+name = "http_default"
+message = "{{ .Message }}"
+`, url)
 }

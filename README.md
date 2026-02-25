@@ -8,6 +8,25 @@
 - single-instance
 - multi-instance (синхронизация через NATS)
 
+## Режимы работы (single vs multi)
+| Характеристика | single-instance | multi-instance |
+|---|---|---|
+| Выбор режима | service.mode=single | service.mode=nats (default) |
+| Входящие события | только HTTP (ingest.http) | HTTP + NATS (ingest.nats) |
+| Хранение состояния | in-memory (локально) | NATS JetStream KV (tick, data) |
+| Синхронизация между инстансами | нет | через NATS (KV + delete-marker consumer) |
+| Зависимость от NATS | отсутствует | обязательна |
+| Notify queue | отключена (не используется) | доступна через JetStream (notify.queue) |
+| Масштабирование | вертикальное | горизонтальное (несколько инстансов) |
+| Доступность | зависит от одного процесса | распределенная (при живом NATS) |
+| Перезапуск сервиса | состояние теряется | состояние сохраняется в NATS |
+
+Ограничения single-instance:
+- вход только HTTP;
+- нет ingest через NATS;
+- нет notify queue;
+- состояние только в памяти процесса.
+
 ## Принципиальная схема
 ```    
                    [ jira ] [ youtrack ] [ muttermost ] [ telegram ]
@@ -26,8 +45,8 @@
  ```
 
 ### Входящие интерфейсы
- - встроенный http_server  
- - подписка на nats
+- single-instance: встроенный http_server.
+- multi-instance: встроенный http_server + подписка на nats+синхронизация сервисов через nats.
 
 ### Исходящие интерфейсы
 - http_client: jira, youtrack, [ произвольный контракт ]
@@ -35,28 +54,30 @@
 - mattermost
 
 ## Целевая рабочая нагрузка и доступность
-- нагрузка multi-instance: `200 000 events/sec`.
+- raw нагрузка multi-instance: 1 000 000 events/sec.
+- ingest нагрузка multi-instance: 200 000 events/sec.
 - доступность multi-instance: 99.99%
 
 ##  Фактическая  нагрузка
-- single-instance
+### Стенд
 - vCPU: 1
-- RAM: 256MB
+- RAM: 256
 ### HTTP 
-Входящих событий/сек
+Входящих (ingest) событий/сек
 | Тип метрики | batch=1  | batch=100 | batch=1000 |
 |---|---:|---:|---:|
-| count_total | 13 511 | 262 263 | 381 104 |
-| count_window | 15 354 | 251 465 | 366 217 |
-| missing_heartbeat | 13 446 | 250 208 | 367 137 |
+| count_total | 13 408 | 266 696 | 383 322 |
+| count_window | 13 504 | 258 132 | 378 275 |
+| missing_heartbeat | 13 376 | 260 619 | 380 405 |
 
 ### NATS 
-Входящих событий/сек
+Входящих (ingest) событий/сек
 | Тип метрики | batch=1 | batch=100 | batch=1000 |
 |---|---:|---:|---:|
-| count_total | 172 566 |  174 606 | 167 814 |
-| count_window | 170 106 | 171 089 | 165 922 |
-| missing_heartbeat | 172 377 | 175 673 | 171 913 |
+| count_total | 2 587 | 384 826 | 422 513 |
+| count_window | 2 447 | 382 404 | 413 736 |
+| missing_heartbeat | 2 583 | 388 332 | 416 613 |
+
 
 ### Основной сценарий использования 
 Агрегаты метрик формируются в ClickHouse и через mat.view nats engine передаются в nats. Алертинг по подписке принимает все агрегаты и по своим правилам взводит или гасит алерт. 
@@ -74,41 +95,43 @@
 - если события по алерту больше не поступают, алерт гасится согласно заданым порогам
 
 # Принцип работы
-1. Событие приходит через HTTP (`ingest.http`) или NATS (`ingest.nats`).
-2. Событие валидируется по контракту (`dt`, `type`, `tags`, `var`, `value`, `agg_cnt`, `win`).
+1. Событие приходит через HTTP (ingest.http) или NATS (ingest.nats).
+2. Событие валидируется по контракту (dt, type, tags, var, value, agg_cnt, win).
 3. Для каждого правила выполняются:
-- фильтр `match` (type/var/tags/value),
-- проверка out-of-order (`max_late_ms`, `max_future_skew_ms`),
-- вычисление `alert_id`.
+- фильтр match (type/var/tags/value),
+- проверка out-of-order (max_late_ms, max_future_skew_ms),
+- вычисление alert_id.
 
-4. `alert_id` формируется детерминированно:
-`rule/<sanitized_rule>/<sanitized_var>/<sha1(key.from_tags)>`.
-Одинаковые `key.from_tags` + одинаковые значения тегов дают один и тот же `alert_id`.
+4. alert_id формируется детерминированно:
+rule/<sanitized_rule>/<sanitized_var>/<sha1(key.from_tags)>.
+Одинаковые key.from_tags + одинаковые значения тегов дают один и тот же alert_id.
 
 5. Движок обновляет runtime-состояние алерта по трем типам алертов:
-- `count_total`: накапливает счетчик,
-- `count_window`: считает скользящее окно,
-- `missing_heartbeat`: срабатывает по отсутствию событий после первого heartbeat.
+- count_total: накапливает счетчик,
+- count_window: считает скользящее окно,
+- missing_heartbeat: срабатывает по отсутствию событий после первого heartbeat.
 
 6. Переходы состояний:
-`pending -> firing -> resolved`.
-`pending` опционален (`pending.enabled`, `pending.delay_sec`).
+pending -> firing -> resolved.
+pending опционален (pending.enabled, pending.delay_sec).
 
-7. Состояние хранится в NATS KV:
-- `tick` — TTL-ключ активности алерта,
-- `data` — карточка алерта (rule/var/tags/state/timestamps/external refs).
+7. Состояние:
+- multi-instance: NATS KV:
+  - tick — TTL-ключ активности алерта,
+  - data — карточка алерта (rule/var/tags/state/timestamps/external refs).
+- single-instance: in-memory (без NATS KV).
 
 8. Закрытие алерта:
-- для `count_total` и `count_window`: по `resolve.silence_sec`,
-- для `missing_heartbeat`: по `raise.missing_sec` и при возврате heartbeat,
-- также по факту TTL-удаления `tick` (delete marker).
+- для count_total и count_window: по resolve.silence_sec,
+- для missing_heartbeat: по raise.missing_sec и при возврате heartbeat,
+- также по факту TTL-удаления tick (delete marker).
 
 9. Уведомления:
-- либо direct-режим (`notify.queue.enabled=false`),
-- либо queue-режим через JetStream worker (`notify.queue.enabled=true`).
-Маршрутизация задается в `[[rule.<rule_name>.notify.route]]` (`channel`, `template`).
+- либо direct-режим (notify.queue.enabled=false),
+- либо queue-режим через JetStream worker (notify.queue.enabled=true).
+Маршрутизация задается в [[rule.<rule_name>.notify.route]] (channel, template).
 
-10. Повторы `firing` управляются `notify.repeat*`.
+10. Повторы firing управляются notify.repeat*.
 В queue-режиме доставка per-channel best-effort (ошибка одного канала не блокирует другие).
 
 
@@ -126,29 +149,59 @@
 }
 ```
 
+Контракт транспорта (общая JSON-схема выше используется и для HTTP, и для NATS):
+- HTTP ingest:
+  - endpoint: `POST <ingest_path>` (по умолчанию `/ingest`).
+  - batch endpoint: `POST <ingest_path>/batch` (по умолчанию `/ingest/batch`).
+  - body:
+    - single: один JSON-объект события.
+    - batch: JSON-массив событий (минимум 1 элемент).
+  - нормальный ответ: `202 Accepted`.
+  - ошибки:
+    - `405 Method Not Allowed` — метод не `POST`;
+    - `400 Bad Request` — невалидный JSON/контракт события/пустой batch;
+    - `503 Service Unavailable` — событие валидно, но внутренняя обработка недоступна.
+- NATS ingest (только multi-instance, `service.mode=nats`):
+  - transport: JetStream queue consumer (`ingest.nats`) с фиксированными runtime-параметрами:
+    - `subject = "alerting.events"`
+    - `stream = "ALERTING_EVENTS"`
+    - `consumer_name = "alerting-ingest"`
+    - `deliver_group = "alerting-workers"`
+  - state backend (NATS KV) также фиксирован в runtime:
+    - `tick_bucket = "tick"`, `data_bucket = "data"`
+    - `delete_consumer_name = "alerting-resolve"`
+    - `delete_deliver_group = "alerting-resolve"`
+    - `delete_subject_wildcard = "$KV.tick.>"`
+  - payload в `msg.Data`:
+    - single: один JSON-объект события;
+    - batch: JSON-массив событий (минимум 1 элемент).
+  - обработка:
+    - decode/validation error: сообщение ACK и отбрасывается (без redelivery);
+    - push/processing error: сообщение NAK и redelivery по policy consumer (`ack_wait_sec`, `nack_delay_ms`, `max_deliver`).
+
 ## Алертинг
 ## Ключ алерта
 KEY - ключ алерта. Нужен для агрегации и дедупликации.
-Формат: `rule/<sanitized_rule_name>/<sanitized_var>/<sha1(key.from_tags)>`, где `sha1` считается по канонической строке `tag=value` для тегов из `key.from_tags` в стабильном порядке.
-`key.from_tags` определяет набор тегов, которые входят в вычисление ключа.
-Если в коннфиге алерта нет обязательного тега из `key.from_tags`, событие игнорируется и пишется warning в лог.
+Формат: rule/<sanitized_rule_name>/<sanitized_var>/<sha1(key.from_tags)>, где sha1 считается по канонической строке tag=value для тегов из key.from_tags в стабильном порядке.
+key.from_tags определяет набор тегов, которые входят в вычисление ключа.
+Если в коннфиге алерта нет обязательного тега из key.from_tags, событие игнорируется и пишется warning в лог.
 
 ##  Фильтрация событий
-К выделению алерта допускаются события`E`, которые прошли фильтр. Фильтр позвожмен по типу события `E.type ∈ rule.types` (например `["event","agg"]`), таги `tags` имена и значения переменных.
+К выделению алерта допускаются событияE, которые прошли фильтр. Фильтр позвожмен по типу события E.type ∈ rule.types (например ["event","agg"]), таги tags имена и значения переменных.
 При этом:
-- `tags` фильтруется только allow-фильтр по ключам и значениям. Если значение не попадает в allow, событие игнорируется
+- tags фильтруется только allow-фильтр по ключам и значениям. Если значение не попадает в allow, событие игнорируется
 - Имена и значения переменных:
-`value.t="n|s|b"`
+value.t="n|s|b"
   t - тип переменной:
   - n: float64
   - s: string
   - b: bool
 
   Возможные операции на каждый тип данных:
-   - `value.t="n"`: `== != > >= < <=`
-   - `value.t="s"`: `== != in prefix match *`
-   - оператор `*` использует glob-маску (`*`, `?`), сравнение без учета регистра
-   - `value.t="b"`: `== !=`
+   - value.t="n": == != > >= < <=
+   - value.t="s": == != in prefix match *
+   - оператор * использует glob-маску (*, ?), сравнение без учета регистра
+   - value.t="b": == !=
 
 
 Если фильтрация не прошла — событие не влияет на алерт.
@@ -156,31 +209,31 @@ KEY - ключ алерта. Нужен для агрегации и дедуп�
 ```
 pending -> firing -> resolved
 ```
-`pending` поддерживается как явное состояние в карточке алерта и в логике переходов.
-Переход `pending -> firing` управляется через `[rule.<rule_name>.pending].enabled` и `[rule.<rule_name>.pending].delay_sec`.
-Для перехода `pending -> firing` условие правила должно выполняться непрерывно весь интервал `pending.delay_sec`.
-Уведомление о входе в `pending` управляется параметром `notify.on_pending`.
-Повторные уведомления в `firing` отправляются по `notify.repeat_every_sec` (в текущем базовом примере: каждые 300 секунд).
-Повтор `firing` ведется отдельно по каждому исходящему каналу.
+pending поддерживается как явное состояние в карточке алерта и в логике переходов.
+Переход pending -> firing управляется через [rule.<rule_name>.pending].enabled и [rule.<rule_name>.pending].delay_sec.
+Для перехода pending -> firing условие правила должно выполняться непрерывно весь интервал pending.delay_sec.
+Уведомление о входе в pending управляется параметром notify.on_pending.
+Повторные уведомления в firing отправляются по notify.repeat_every_sec (в текущем базовом примере: каждые 300 секунд).
+Повтор firing ведется отдельно по каждому исходящему каналу.
 Доставка работает в двух режимах:
-- `notify.queue.enabled=true`: событие -> общее построение `Notification` -> enqueue в `notify.queue` -> worker рендерит шаблон из `[[notify.<channel>.name-template]]` -> транспорт канала.
-- `notify.queue.enabled=false`: событие -> общее построение `Notification` -> немедленная отправка через dispatcher/transport в процессе manager (без отдельной очереди).
-При `notify.queue.dlq.enabled=true` недоставленные jobs (permanent error / исчерпан `max_deliver`) пишутся в отдельный DLQ stream.
-В правиле хранится только привязка `[[rule.<rule_name>.notify.route]]` (`channel` + `template`).
-При переходе в `resolved` объект алерта удаляется из runtime/KV-представления.
-При переходе `firing -> resolved` всегда отправляется одно `resolved`-уведомление (независимо от `notify.repeat_on`).
-- `best-effort` per-channel гарантируется в queue-режиме.
+- notify.queue.enabled=true: событие -> общее построение Notification -> enqueue в notify.queue -> worker рендерит шаблон из [[notify.<channel>.name-template]] -> транспорт канала.
+- notify.queue.enabled=false: событие -> общее построение Notification -> немедленная отправка через dispatcher/transport в процессе manager (без отдельной очереди).
+При notify.queue.dlq=true недоставленные jobs (permanent error / исчерпан max_deliver) пишутся в отдельный DLQ stream.
+В правиле хранится только привязка [[rule.<rule_name>.notify.route]] (channel + template).
+При переходе в resolved объект алерта удаляется из runtime/KV-представления.
+При переходе firing -> resolved всегда отправляется одно resolved-уведомление (независимо от notify.repeat_on).
+- best-effort per-channel гарантируется в queue-режиме.
 - В direct-режиме отправка fail-fast: ошибка канала прерывает dispatch текущего уведомления.
-Для канала Telegram `resolved` отправляется с `reply` на первое сообщение открытия алерта (`pending` или `firing`, что было отправлено первым).
-Для каналов Jira/YouTrack `firing` выполняет create issue, а `resolved` закрывает/transition ту же задачу по сохраненному `external_ref` (`alert card` в NATS KV).
-При ошибке отправки выполняются ретраи по `notify.<channel>.retry` с логированием каждой ошибки/попытки (в dispatcher, в обоих режимах доставки).
+Для канала Telegram resolved отправляется с reply на первое сообщение открытия алерта (pending или firing, что было отправлено первым).
+Для каналов Jira/YouTrack firing выполняет create issue, а resolved закрывает/transition ту же задачу по сохраненному external_ref (alert card в NATS KV).
+При ошибке отправки выполняются ретраи по notify.<channel>.retry с логированием каждой ошибки/попытки (в dispatcher, в обоих режимах доставки).
 
 ### Out-of-order события
-Обработка окон ведется по времени обработки `now`.
+Обработка окон ведется по времени обработки now.
 
 Рекомендуемые защитные параметры:
-- `max_late_ms` — если `now - dt > max_late_ms`, событие игнорируется и логируется (`warn`).
-- `max_future_skew_ms` — если `dt > now + max_future_skew_ms`, событие игнорируется и логируется (`warn`).
+- max_late_ms — если now - dt > max_late_ms, событие игнорируется и логируется (warn).
+- max_future_skew_ms — если dt > now + max_future_skew_ms, событие игнорируется и логируется (warn).
 
 ## Тип алерта "CountTotal"
 ```
@@ -203,7 +256,7 @@ DOWN:
 - raise.tagg_sec
 - raise.missing_sec
 ```
-Пример: `configs/alerts/rules.count_total.toml`.
+Пример: configs/alerts/rules.count_total.toml.
 
 ## Тип алерта "CountWindow"
 ```
@@ -225,7 +278,7 @@ DOWN:
 Запрещённые параметры (конфиг):
 - raise.missing_sec
 ```
-Пример: `configs/alerts/rules.count_window.toml`.
+Пример: configs/alerts/rules.count_window.toml.
 
 ##  Тип алерта "MissingHeartbeat"
 ```
@@ -247,62 +300,65 @@ DOWN:
 - raise.tagg_sec
 - resolve.silence_sec
 ```
-Пример: `configs/alerts/rules.missing_heartbeat.toml`.
+Пример: configs/alerts/rules.missing_heartbeat.toml.
 
 # Доставка уведомлений
 Общая схема доставки:
-- при `notify.queue.enabled=true`: `event -> alert decision -> Notification -> notify.queue (JetStream) -> delivery worker -> transport channel`;
-- при `notify.queue.enabled=false`: `event -> alert decision -> Notification -> dispatcher -> transport channel`.
-- Глобальные настройки доставки: `configs/alerts/base.toml` (`[notify]`, `[notify.queue]`).
-- Маршрутизация задается в правилах через `[[rule.<rule_name>.notify.route]]` (`channel`, `template`).
-  Актуальные rule-файлы: `configs/alerts/rules.count_total.toml`, `configs/alerts/rules.count_window.toml`, `configs/alerts/rules.missing_heartbeat.toml`.
-- В исходящем уведомлении `alert_id` обязателен и равен ключу алерта (`rule/<sanitized_rule>/<sanitized_var>/<sha1(key.from_tags)>`).
-- Отдельный `notification_id` не используется.
+- при notify.queue.enabled=true: event -> alert decision -> Notification -> notify.queue (JetStream) -> delivery worker -> transport channel;
+- при notify.queue.enabled=false: event -> alert decision -> Notification -> dispatcher -> transport channel.
+- Глобальные настройки доставки: configs/alerts/base.toml ([notify], [notify.queue]).
+- Маршрутизация задается в правилах через [[rule.<rule_name>.notify.route]] (channel, template).
+  Актуальные rule-файлы: configs/alerts/rules.count_total.toml, configs/alerts/rules.count_window.toml, configs/alerts/rules.missing_heartbeat.toml.
+- В исходящем уведомлении alert_id обязателен и равен ключу алерта (rule/<sanitized_rule>/<sanitized_var>/<sha1(key.from_tags)>).
+- Отдельный notification_id не используется.
 
 **Обязателен только любой один канал доставки**
 
 # Каналы доставки
 ## Telegram
-- Транспортный конфиг: `configs/alerts/notify.telegram.toml`.
-- Логика: `firing` отправляет сообщение открытия алерта; `resolved` отправляется reply на первое сообщение этого алерта (по сохраненному `message_id`).
+- Транспортный конфиг: configs/alerts/notify.telegram.toml.
+- Логика: firing отправляет сообщение открытия алерта; resolved отправляется reply на первое сообщение этого алерта (по сохраненному message_id).
 
 ## Mattermost
-- Транспортный конфиг: `configs/alerts/notify.mattermost.toml`.
-- Логика: `firing` создает post в Mattermost; `resolved` публикуется в thread этого алерта через `root_id` (ссылка на `post.id` сообщения `firing`).
+- Транспортный конфиг: configs/alerts/notify.mattermost.toml.
+- Логика: firing создает post в Mattermost; resolved публикуется в thread этого алерта через root_id (ссылка на post.id сообщения firing).
 
 ## Jira
-- Транспортный конфиг: `configs/alerts/notify.jira.toml`.
-- Логика: `firing` создает задачу, `resolved` закрывает/переводит задачу по сохраненному `external_ref`.
+- Транспортный конфиг: configs/alerts/notify.jira.toml.
+- Логика: firing создает задачу, resolved закрывает/переводит задачу по сохраненному external_ref.
 - Планы: ввести матрицу ответственности по типу инцидента. 
 
 ## YouTrack
-- Транспортный конфиг: `configs/alerts/notify.youtrack.toml`.
-- Логика аналогична Jira: `firing` create, `resolved` close/resolve через сохраненный `external_ref`.
+- Транспортный конфиг: configs/alerts/notify.youtrack.toml.
+- Логика аналогична Jira: firing create, resolved close/resolve через сохраненный external_ref.
 - Планы: ввести матрицу ответственности по типу инцидента. 
 
 # Конфиг (TOML)
 ## Структура конфигов
-- `configs/alerts/base.toml` — глобальный конфиг сервиса:
-  - `[service]` — process/runtime настройки (`name`, `reload_*`, `resolve_scan_interval_sec`, runtime state limits).
-  - `[ingest.http]` — HTTP server/ingest (`listen`, `health_path`, `ready_path`, `ingest_path`, `max_body_bytes`, `enabled`).
-  - `[log.*]`, `[ingest.nats]`, `[notify]` — остальные подсистемы.
-- `configs/alerts/rules.count_total.toml` — правила типа `count_total` (`[rule.<rule_name>]`, `[rule.<rule_name>.*]`).
-- `configs/alerts/rules.count_window.toml` — правила типа `count_window`.
-- `configs/alerts/rules.missing_heartbeat.toml` — правила типа `missing_heartbeat`.
-- `configs/alerts/notify.telegram.toml` — transport-конфиг Telegram (`[notify.telegram]`, `[notify.telegram.retry]`, `[[notify.telegram.name-template]]`).
-- `configs/alerts/notify.mattermost.toml` — transport-конфиг Mattermost (`[notify.mattermost]`, `[notify.mattermost.retry]`, `[[notify.mattermost.name-template]]`).
-- `configs/alerts/notify.jira.toml` — transport-конфиг Jira (`[notify.jira]`, `[notify.jira.auth]`, `[notify.jira.create]`, `[notify.jira.resolve]`, `[[notify.jira.name-template]]`).
-- `configs/alerts/notify.youtrack.toml` — transport-конфиг YouTrack (`[notify.youtrack]`, `[notify.youtrack.auth]`, `[notify.youtrack.create]`, `[notify.youtrack.resolve]`, `[[notify.youtrack.name-template]]`).
-- `configs/live.telegram.env` — env для live e2e теста Telegram.
-- `deploy/nats/*` — bootstrap/verify/cleanup скрипты для stream/KV/consumers.
+- configs/alerts/base.toml — глобальный конфиг сервиса:
+  - [service] — process/runtime настройки (name, reload_*, resolve_scan_interval_sec, runtime state limits).
+  - [ingest.http] — HTTP server/ingest (listen, health_path, ready_path, ingest_path, max_body_bytes, enabled).
+  - [log.*], [ingest.nats], [notify] — остальные подсистемы.
+- configs/alerts/rules.count_total.toml — правила типа count_total ([rule.<rule_name>], [rule.<rule_name>.*]).
+- configs/alerts/rules.count_window.toml — правила типа count_window.
+- configs/alerts/rules.missing_heartbeat.toml — правила типа missing_heartbeat.
+- configs/alerts/notify.telegram.toml — transport-конфиг Telegram ([notify.telegram], [notify.telegram.retry], [[notify.telegram.name-template]]).
+- configs/alerts/notify.mattermost.toml — transport-конфиг Mattermost ([notify.mattermost], [notify.mattermost.retry], [[notify.mattermost.name-template]]).
+- configs/alerts/notify.jira.toml — transport-конфиг Jira ([notify.jira], [notify.jira.auth], [notify.jira.create], [notify.jira.resolve], [[notify.jira.name-template]]).
+- configs/alerts/notify.youtrack.toml — transport-конфиг YouTrack ([notify.youtrack], [notify.youtrack.auth], [notify.youtrack.create], [notify.youtrack.resolve], [[notify.youtrack.name-template]]).
+- configs/live.telegram.env — env для live e2e теста Telegram.
+- deploy/nats/* — bootstrap/verify/cleanup скрипты для stream/KV/consumers.
 
 
 ## Глобальный конфиг сервиса
+### Multi-instance
 ```toml
 # base.toml
 [service]
 # Логическое имя процесса (для логов/диагностики).
 name = "alerting"
+# Явный multi-instance режим.
+mode = "nats"
 # Включает периодический hot reload конфигов.
 reload_enabled = true
 # Интервал проверки изменений конфигов (сек).
@@ -351,21 +407,16 @@ ingest_path = "/ingest"
 # Максимальный размер тела запроса (байт).
 max_body_bytes = 1048576
 
+
 [ingest.nats]
-# В этом профиле NATS ingest отключен.
-# Если включить, нужно дополнительно задать URL/subject.
-enabled = false
+# В multi-instance режиме NATS ingest включен.
+enabled = true
 # Список URL NATS/JetStream (драйвер поддерживает несколько адресов).
 # Этот же список используется и для state backend (отдельной state-секции нет).
 url = ["nats://127.0.0.1:4222"]
-# Subject, куда внешние сервисы публикуют входящие события.
-subject = "alerting.events"
-# Stream JetStream, к которому привязан subject очереди.
-stream = "ALERTING_EVENTS"
-# Durable имя ingest consumer (общее для всех инстансов alerting в группе).
-consumer_name = "alerting-ingest"
-# Deliver group ingest consumer: инстансы делят сообщения очереди.
-deliver_group = "alerting-workers"
+# Количество параллельных ingest workers внутри одного процесса.
+# Рекомендуется >1 для high-load NATS ingest.
+workers = 4
 # Ack timeout (сек): если не ack вовремя, сообщение будет redelivered.
 ack_wait_sec = 30
 # Задержка перед NAK redelivery (мс) при ошибке обработки.
@@ -402,16 +453,8 @@ on_pending = false
 # Асинхронная очередь доставки уведомлений (отдельно от ingest path).
 # Если включено, manager только публикует jobs, а отправка по каналам идет worker-ом.
 enabled = true
-# URL NATS/JetStream для очереди доставки.
-url = "nats://127.0.0.1:4222"
-# Subject jobs доставки.
-subject = "alerting.notify.jobs"
-# Stream JetStream для subject очереди доставки.
-stream = "ALERTING_NOTIFY"
-# Durable имя worker consumer.
-consumer_name = "alerting-notify"
-# Deliver group worker consumer: инстансы делят jobs доставки.
-deliver_group = "alerting-notify-workers"
+# Включить fixed DLQ для permanent/max-deliver ошибок.
+dlq = true
 # Ack timeout (сек): если worker не ack вовремя, job будет redelivered.
 ack_wait_sec = 30
 # Задержка перед NAK redelivery (мс) при ошибке отправки.
@@ -421,22 +464,60 @@ nack_delay_ms = 1000
 max_deliver = -1
 # Максимум unacked jobs у consumer.
 max_ack_pending = 4096
-
-[notify.queue.dlq]
-# Опциональный DLQ для jobs, которые не доставлены:
-# - permanent ошибки (конфиг/шаблон/маршрутизация),
-# - исчерпан max_deliver.
-enabled = true
-# Subject, куда worker пишет DLQ записи.
-subject = "alerting.notify.jobs.dlq"
-# Stream JetStream для DLQ subject.
-stream = "ALERTING_NOTIFY_DLQ"
 ```
-`rule_name` специальных ограничений формата не имеет; используется значение, прошедшее валидацию TOML-конфига и проверку уникальности.
+rule_name специальных ограничений формата не имеет; используется значение, прошедшее валидацию TOML-конфига и проверку уникальности.
 
+
+### Single-instance
+```toml
+# base.toml
+[service]
+# Режим single-instance (без NATS).
+mode = "single"
+name = "alerting"
+reload_enabled = true
+reload_interval_sec = 3
+resolve_scan_interval_sec = 1
+
+[log.console]
+enabled = true
+level = "info"
+format = "line"
+
+[log.file]
+enabled = true
+level = "info"
+format = "line"
+path = "./alerting.log"
+
+[ingest.http]
+enabled = true
+listen = "127.0.0.1:8080"
+health_path = "/healthz"
+ready_path = "/readyz"
+ingest_path = "/ingest"
+max_body_bytes = 1048576
+
+[notify]
+repeat = true
+repeat_every_sec = 300
+repeat_on = ["firing"]
+repeat_per_channel = true
+on_pending = false
+
+```
+
+### Конфиги уведомлений
+- Канальные конфиги хранятся в configs/alerts/.
+- `[notify.<channel>.retry]` — ретраи задаются отдельно для каждого канала, без глобального retry.
+- `[[notify.<channel>.name-template]]` — шаблоны канал-специфичны и выбираются из `[[rule.<rule_name>.notify.route]]` (`channel + template`).
+
+### Hot reload
+Конфиги могут применяться без перезапуска сервиса
 
 # Подготовка контура
 ## NATS
+Актуально только для режима работу multi-instance 
 Перед запуском должен быть доступен NATS Server с включенным JetStream.
 
 Стандарт эксплуатации: NATS контур готовится полностью скриптом bootstrap
@@ -457,14 +538,27 @@ cp ./deploy/nats/.env.example ./deploy/nats/.env
 ```bash
 ./deploy/nats/verify.sh ./deploy/nats/.env
 ```
-Ожидаемый результат: `NATS deploy verification OK ...`.
+Ожидаемый результат: NATS deploy verification OK ....
 
-`tick` KV stream дополнительно нормализуется сервисом при старте (`AllowMsgTTL=true`, `SubjectDeleteMarkerTTL>0`) для корректной TTL delete-marker логики.
+tick KV stream дополнительно нормализуется сервисом при старте (AllowMsgTTL=true, SubjectDeleteMarkerTTL>0) для корректной TTL delete-marker логики.
 
 ## Запуск сервиса алертинга
 ```bash
 alerting --config-dir ./configs/alerts
 ```
 
-## Hot reload
-Конфиги могут применяться без перезапуска сервиса
+# Мониторинг сервиса
+Контракт HTTP endpoints
+- GET /healthz:
+  - нормальный ответ: `200 OK`, body: `ok`.
+  - используется для liveness (процесс жив).
+- GET /readyz:
+  - нормальный ответ: `200 OK`, body: `ready`.
+  - пока сервис не готов/уходит в shutdown: `503 Service Unavailable`, body: `not-ready`.
+- POST /ingest[/batch]:
+  - нормальный ответ: `202 Accepted` для валидного события.
+  - поддерживается batch endpoint `POST <ingest_path>/batch` (например `/ingest/batch`), нормальный ответ: `202 Accepted`.
+  - ошибки:
+    - `405 Method Not Allowed` — если метод не `POST`.
+    - `400 Bad Request` — невалидный JSON/схема события или невалидный batch.
+    - `503 Service Unavailable` — событие декодировано, но внутренняя обработка недоступна (push error).

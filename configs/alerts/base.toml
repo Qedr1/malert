@@ -8,6 +8,8 @@
 [service]
 # Логическое имя процесса (для логов/диагностики).
 name = "alerting"
+# Явный multi-instance режим (NATS-backed).
+mode = "nats"
 # Включает периодический hot reload конфигов.
 reload_enabled = true
 # Интервал проверки изменений конфигов (сек).
@@ -57,20 +59,13 @@ ingest_path = "/ingest"
 max_body_bytes = 1048576
 
 [ingest.nats]
-# В этом профиле NATS ingest отключен.
-# Если включить, нужно дополнительно задать URL/subject.
-enabled = false
+# В multi-instance режиме NATS ingest включен.
+enabled = true
 # Список URL NATS/JetStream (драйвер поддерживает несколько адресов).
 # Этот же список используется и для state backend (отдельной state-секции нет).
 url = ["nats://127.0.0.1:4222"]
-# Subject, куда внешние сервисы публикуют входящие события.
-subject = "alerting.events"
-# Stream JetStream, к которому привязан subject очереди.
-stream = "ALERTING_EVENTS"
-# Durable имя ingest consumer (общее для всех инстансов alerting в группе).
-consumer_name = "alerting-ingest"
-# Deliver group ingest consumer: инстансы делят сообщения очереди.
-deliver_group = "alerting-workers"
+# workers: число параллельных ingest workers внутри одного процесса.
+workers = 4
 # Ack timeout (сек): если не ack вовремя, сообщение будет redelivered.
 ack_wait_sec = 30
 # Задержка перед NAK redelivery (мс) при ошибке обработки.
@@ -107,16 +102,8 @@ on_pending = false
 # Асинхронная очередь доставки уведомлений (отдельно от ingest path).
 # Если включено, manager только публикует jobs, а отправка по каналам идет worker-ом.
 enabled = true
-# URL NATS/JetStream для очереди доставки.
-url = "nats://127.0.0.1:4222"
-# Subject jobs доставки.
-subject = "alerting.notify.jobs"
-# Stream JetStream для subject очереди доставки.
-stream = "ALERTING_NOTIFY"
-# Durable имя worker consumer.
-consumer_name = "alerting-notify"
-# Deliver group worker consumer: инстансы делят jobs доставки.
-deliver_group = "alerting-notify-workers"
+# Включить fixed DLQ для permanent/max-deliver ошибок.
+dlq = true
 # Ack timeout (сек): если worker не ack вовремя, job будет redelivered.
 ack_wait_sec = 30
 # Задержка перед NAK redelivery (мс) при ошибке отправки.
@@ -126,13 +113,3 @@ nack_delay_ms = 1000
 max_deliver = -1
 # Максимум unacked jobs у consumer.
 max_ack_pending = 4096
-
-[notify.queue.dlq]
-# Опциональный DLQ для jobs, которые не доставлены:
-# - permanent ошибки (конфиг/шаблон/маршрутизация),
-# - исчерпан max_deliver.
-enabled = true
-# Subject, куда worker пишет DLQ записи.
-subject = "alerting.notify.jobs.dlq"
-# Stream JetStream для DLQ subject.
-stream = "ALERTING_NOTIFY_DLQ"

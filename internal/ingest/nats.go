@@ -16,8 +16,8 @@ import (
 // Params: NATS connection, JetStream queue subscription, and event sink.
 // Returns: NATS ingest lifecycle handle.
 type NATSSubscriber struct {
-	nc     *nats.Conn
-	sub    *nats.Subscription
+	conns  []*nats.Conn
+	subs   []*nats.Subscription
 	logger *slog.Logger
 }
 
@@ -25,19 +25,9 @@ type NATSSubscriber struct {
 // Params: ingest NATS config, sink, and optional logger.
 // Returns: started subscriber or initialization error.
 func NewNATSSubscriber(cfg config.NATSIngestConfig, sink EventSink, logger *slog.Logger) (*NATSSubscriber, error) {
-	nc, err := nats.Connect(strings.Join(cfg.URL, ","))
-	if err != nil {
-		return nil, fmt.Errorf("connect nats ingest: %w", err)
-	}
-	js, err := nc.JetStream()
-	if err != nil {
-		nc.Close()
-		return nil, fmt.Errorf("jetstream init for ingest: %w", err)
-	}
-
-	subscriber := &NATSSubscriber{
-		nc:     nc,
-		logger: logger,
+	workers := cfg.Workers
+	if workers <= 0 {
+		workers = 1
 	}
 	ackWait := time.Duration(cfg.AckWaitSec) * time.Second
 	nackDelay := time.Duration(cfg.NackDelayMS) * time.Millisecond
@@ -51,30 +41,59 @@ func NewNATSSubscriber(cfg config.NATSIngestConfig, sink EventSink, logger *slog
 		nats.MaxAckPending(cfg.MaxAckPending),
 		nats.DeliverAll(),
 	}
-	sub, err := js.QueueSubscribe(cfg.Subject, cfg.DeliverGroup, func(message *nats.Msg) {
-		event, decodeErr := domain.DecodeEvent(message.Data)
-		if decodeErr != nil {
-			if logger != nil {
-				logger.Warn("nats ingest decode failed", "subject", message.Subject, "error", decodeErr.Error())
-			}
-			subscriber.ackMessage(message, "decode")
-			return
-		}
-		if pushErr := sink.Push(event); pushErr != nil {
-			if logger != nil {
-				logger.Error("nats ingest push failed", "subject", message.Subject, "error", pushErr.Error())
-			}
-			subscriber.nackMessage(message, nackDelay)
-			return
-		}
-		subscriber.ackMessage(message, "processed")
-	}, subOpts...)
-	if err != nil {
-		nc.Close()
-		return nil, fmt.Errorf("queue subscribe %q/%q: %w", cfg.Subject, cfg.DeliverGroup, err)
+
+	subscriber := &NATSSubscriber{
+		conns:  make([]*nats.Conn, 0, workers),
+		subs:   make([]*nats.Subscription, 0, workers),
+		logger: logger,
 	}
-	subscriber.sub = sub
+
+	for workerIndex := 0; workerIndex < workers; workerIndex++ {
+		nc, err := nats.Connect(strings.Join(cfg.URL, ","))
+		if err != nil {
+			_ = subscriber.Close()
+			return nil, fmt.Errorf("connect nats ingest worker %d: %w", workerIndex, err)
+		}
+		js, err := nc.JetStream()
+		if err != nil {
+			nc.Close()
+			_ = subscriber.Close()
+			return nil, fmt.Errorf("jetstream init for ingest worker %d: %w", workerIndex, err)
+		}
+		sub, err := js.QueueSubscribe(cfg.Subject, cfg.DeliverGroup, func(message *nats.Msg) {
+			scratch := acquireDecodeScratch()
+			defer releaseDecodeScratch(scratch)
+
+			events, decodeErr := decodeNATSEvents(message.Data, scratch)
+			if decodeErr != nil {
+				if logger != nil {
+					logger.Warn("nats ingest decode failed", "subject", message.Subject, "error", decodeErr.Error())
+				}
+				subscriber.ackMessage(message, "decode")
+				return
+			}
+			if pushErr := pushEvents(sink, events); pushErr != nil {
+				if logger != nil {
+					logger.Error("nats ingest push failed", "subject", message.Subject, "error", pushErr.Error())
+				}
+				subscriber.nackMessage(message, nackDelay)
+				return
+			}
+			subscriber.ackMessage(message, "processed")
+		}, subOpts...)
+		if err != nil {
+			nc.Close()
+			_ = subscriber.Close()
+			return nil, fmt.Errorf("queue subscribe %q/%q worker %d: %w", cfg.Subject, cfg.DeliverGroup, workerIndex, err)
+		}
+		subscriber.conns = append(subscriber.conns, nc)
+		subscriber.subs = append(subscriber.subs, sub)
+	}
 	return subscriber, nil
+}
+
+func decodeNATSEvents(raw []byte, scratch *decodeScratch) ([]domain.Event, error) {
+	return decodeEventPayloadInto(raw, scratch)
 }
 
 // ackMessage acknowledges processed/invalid message and logs ack failures.
@@ -111,12 +130,19 @@ func (s *NATSSubscriber) nackMessage(message *nats.Msg, delay time.Duration) {
 // Params: none.
 // Returns: close error from subscription drain.
 func (s *NATSSubscriber) Close() error {
-	if s.sub != nil {
-		if err := s.sub.Drain(); err != nil {
-			s.nc.Close()
-			return err
+	var firstErr error
+	for _, sub := range s.subs {
+		if sub == nil {
+			continue
+		}
+		if err := sub.Drain(); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	s.nc.Close()
-	return nil
+	for _, nc := range s.conns {
+		if nc != nil {
+			nc.Close()
+		}
+	}
+	return firstErr
 }

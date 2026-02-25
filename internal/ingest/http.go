@@ -47,40 +47,26 @@ func (h *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	defer request.Body.Close()
 	decoder := json.NewDecoder(request.Body)
 	if isBatchPath(request.URL.Path) {
-		events, decodeErr := domain.DecodeEventsReader(decoder)
+		events, decodeErr := decodeBatchEvents(decoder)
 		if decodeErr != nil {
 			writer.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		if sink, ok := h.sink.(batchEventSink); ok {
-			if pushErr := sink.PushBatch(events); pushErr != nil {
-				writer.WriteHeader(http.StatusServiceUnavailable)
-				return
-			}
-			writer.WriteHeader(http.StatusAccepted)
+		if pushErr := pushEvents(h.sink, events); pushErr != nil {
+			writer.WriteHeader(http.StatusServiceUnavailable)
 			return
-		}
-		for _, event := range events {
-			if pushErr := h.sink.Push(event); pushErr != nil {
-				writer.WriteHeader(http.StatusServiceUnavailable)
-				return
-			}
 		}
 		writer.WriteHeader(http.StatusAccepted)
 		return
 	}
 
-	event, decodeErr := domain.DecodeEventReader(decoder)
+	event, decodeErr := decodeSingleEvent(decoder)
 	if decodeErr != nil {
 		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	if pushErr := h.sink.Push(event); pushErr != nil {
 		writer.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
-	if decoder.More() {
-		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	writer.WriteHeader(http.StatusAccepted)

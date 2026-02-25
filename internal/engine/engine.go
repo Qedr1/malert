@@ -41,6 +41,19 @@ type AlertIdentity struct {
 	MetricValue string
 }
 
+// RepeatSnapshot stores minimal runtime fields for repeat notifications.
+// Params: immutable alert identity and repeat timing markers.
+// Returns: lightweight snapshot for repeat scheduling.
+type RepeatSnapshot struct {
+	AlertID      string
+	RuleName     string
+	Var          string
+	Tags         map[string]string
+	MetricValue  string
+	RaisedAt     time.Time
+	LastNotified map[string]time.Time
+}
+
 // WindowPoint stores one count contribution in sliding window.
 // Params: event processing time and event contribution count.
 // Returns: one window sample for count_window rule.
@@ -310,8 +323,29 @@ func (e *Engine) GetAlertIdentity(alertID string) (AlertIdentity, bool) {
 	}
 	return AlertIdentity{
 		Var:         state.Var,
-		Tags:        state.Tags,
+		Tags:        cloneTags(state.Tags),
 		MetricValue: state.MetricValue,
+	}, true
+}
+
+// GetRepeatSnapshot returns lightweight runtime snapshot for repeat notifications.
+// Params: alert ID.
+// Returns: snapshot and existence flag.
+func (e *Engine) GetRepeatSnapshot(alertID string) (RepeatSnapshot, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	state, ok := e.states[alertID]
+	if !ok {
+		return RepeatSnapshot{}, false
+	}
+	return RepeatSnapshot{
+		AlertID:      state.AlertID,
+		RuleName:     state.RuleName,
+		Var:          state.Var,
+		Tags:         cloneTags(state.Tags),
+		MetricValue:  state.MetricValue,
+		RaisedAt:     state.RaisedAt,
+		LastNotified: cloneTimes(state.LastNotified),
 	}, true
 }
 
