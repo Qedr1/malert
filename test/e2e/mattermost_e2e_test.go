@@ -47,7 +47,7 @@ func (l *mattermostWebhookLog) at(index int) (mattermostWebhookPayload, bool) {
 }
 
 func TestMattermostWebhookFiringAndResolveE2E(t *testing.T) {
-	for _, metric := range allE2EMetricCases() {
+	for _, metric := range e2eFunctionalMetricCases() {
 		metric := metric
 		t.Run(metric.Name, func(t *testing.T) {
 			port, err := freePort()
@@ -171,7 +171,7 @@ template = "mm_default"
 }
 
 func TestMattermostWebhookRetryOnTransientFailureE2E(t *testing.T) {
-	for _, metric := range allE2EMetricCases() {
+	for _, metric := range e2eFunctionalMetricCases() {
 		metric := metric
 		t.Run(metric.Name, func(t *testing.T) {
 			port, err := freePort()

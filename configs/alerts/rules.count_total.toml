@@ -37,6 +37,8 @@ n = 1
 # Порог гашения: если новых событий нет silence_sec секунд -> resolved.
 # Гасим алерт после тишины 60 секунд.
 silence_sec = 60
+# Дополнительный гистерезис перед resolved (сек).
+hysteresis_sec = 0
 
 [rule.ct_telegram_live.pending]
 # Включает стадию pending перед firing.

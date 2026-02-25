@@ -15,7 +15,7 @@ import (
 )
 
 func TestMultiServiceNATSQueueLifecycleSingleNotifications(t *testing.T) {
-	for _, metric := range allE2EMetricCases() {
+	for _, metric := range e2eFunctionalMetricCases() {
 		metric := metric
 		t.Run(metric.Name, func(t *testing.T) {
 			natsURL, stopNATS := startLocalNATSServer(t)

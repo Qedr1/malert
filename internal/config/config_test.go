@@ -1,73 +1,44 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
+const (
+	ingestHTTPEnabled = `[ingest.http]
+enabled = true`
+	ingestHTTPListen = `[ingest.http]
+enabled = true
+listen = "127.0.0.1:18081"`
+	ingestHTTPDisabled = `[ingest.http]
+enabled = false`
+	ingestNATSEnabled = `[ingest.nats]
+enabled = true`
+)
+
 func TestLoadSnapshotFromFile(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-listen = "127.0.0.1:18081"
-
-[notify]
+	cfg := mustLoadSnapshot(t, joinSections(
+		serviceSection(""),
+		ingestHTTPListen,
+		`[notify]
 repeat = true
-repeat_every_sec = 300
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[notify.telegram.retry]
+repeat_every_sec = 300`,
+		telegramNotifySection("token", "chat", "", "tg_default", "[{{ .RuleName }}] {{ .Message }}"),
+		`[notify.telegram.retry]
 enabled = true
 backoff = "exponential"
 initial_ms = 10
 max_ms = 100
 max_attempts = 0
-log_each_attempt = true
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "[{{ .RuleName }}] {{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"], service = ["api"] }
-
-[rule.ct.key]
-from_tags = ["dc", "service"]
-
-[rule.ct.raise]
-n = 2
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	cfg, err := LoadSnapshot(ConfigSource{File: path})
-	if err != nil {
-		t.Fatalf("load snapshot: %v", err)
-	}
+log_each_attempt = true`,
+		countTotalRule(routeBlock("telegram", "tg_default")),
+	))
 
 	if cfg.Service.Name != "alerting" {
 		t.Fatalf("unexpected service name %q", cfg.Service.Name)
@@ -87,63 +58,11 @@ func TestLoadSnapshotFromDirAndDuplicateRuleValidation(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	fileA := filepath.Join(tmpDir, "a.toml")
-	fileB := filepath.Join(tmpDir, "b.toml")
-
-	writeConfigFile(t, fileA, `
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.same]
-alert_type = "count_total"
-
-[rule.same.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"], service = ["api"] }
-
-[rule.same.key]
-from_tags = ["dc", "service"]
-
-[rule.same.raise]
-n = 2
-
-[rule.same.resolve]
-silence_sec = 5
-
-[[rule.same.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`)
-
-	writeConfigFile(t, fileB, `
-[rule.same]
-alert_type = "count_total"
-
-[rule.same.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"], service = ["api"] }
-
-[rule.same.key]
-from_tags = ["dc", "service"]
-
-[rule.same.raise]
-n = 2
-
-[rule.same.resolve]
-silence_sec = 5
-
-[[rule.same.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`)
+	writeConfigFile(t, filepath.Join(tmpDir, "a.toml"), joinSections(
+		telegramNotifySection("token", "chat", "", "tg_default", "{{ .Message }}"),
+		countTotalRule(routeBlock("telegram", "tg_default")),
+	))
+	writeConfigFile(t, filepath.Join(tmpDir, "b.toml"), countTotalRule(routeBlock("telegram", "tg_default")))
 
 	_, err := LoadSnapshot(ConfigSource{Dir: tmpDir})
 	if err == nil {
@@ -157,1035 +76,378 @@ template = "tg_default"
 func TestLoadSnapshotRejectsEnabledTelegramWithoutCredentials(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.telegram]
-enabled = true
-bot_token = ""
-chat_id = ""
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
-	}
+	err := loadSnapshotErr(t, joinSections(
+		serviceSection(""),
+		ingestHTTPEnabled,
+		telegramNotifySection("", "", "", "tg_default", "{{ .Message }}"),
+		countTotalRule(routeBlock("telegram", "tg_default")),
+	))
 	if !strings.Contains(err.Error(), "notify.telegram.bot_token") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-func TestLoadSnapshotAcceptsEnabledMattermost(t *testing.T) {
+func TestLoadSnapshotTemplateValidation(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.mattermost]
-enabled = true
-base_url = "https://mattermost.example"
-bot_token = "mm-bot-token"
-channel_id = "channel-123"
-
-[[notify.mattermost.name-template]]
-name = "mm_default"
-message = "[{{ .RuleName }}] {{ .State }} {{ .Var }}={{ .MetricValue }}"
-
-[rule.mm]
-alert_type = "count_total"
-
-[rule.mm.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.mm.key]
-from_tags = ["dc"]
-
-[rule.mm.raise]
-n = 1
-
-[rule.mm.resolve]
-silence_sec = 5
-
-[[rule.mm.notify.route]]
-channel = "mattermost"
-template = "mm_default"
-`
-	writeConfigFile(t, path, content)
-
-	cfg, err := LoadSnapshot(ConfigSource{File: path})
-	if err != nil {
-		t.Fatalf("load snapshot: %v", err)
+	tests := []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{
+			name: "reject invalid telegram template",
+			content: joinSections(
+				serviceSection(""),
+				ingestHTTPEnabled,
+				telegramNotifySection("token", "chat", "", "tg_default", "{{ .AlertID "),
+				countTotalRule(routeBlock("telegram", "tg_default")),
+			),
+			wantErr: "notify.telegram.name-template[0].message",
+		},
+		{
+			name: "allow fmtDuration template func",
+			content: joinSections(
+				serviceSection(""),
+				ingestHTTPEnabled,
+				telegramNotifySection("token", "chat", "", "tg_default", "delta={{ fmtDuration .Duration }}"),
+				countTotalRule(routeBlock("telegram", "tg_default")),
+			),
+		},
 	}
-	if !cfg.Notify.Mattermost.Enabled {
-		t.Fatalf("expected mattermost enabled")
-	}
-	if cfg.Notify.Mattermost.TimeoutSec != 10 {
-		t.Fatalf("expected default mattermost timeout=10, got %d", cfg.Notify.Mattermost.TimeoutSec)
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := loadSnapshotFromContent(t, tt.content)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("load snapshot: %v", err)
+				}
+				if len(cfg.Rule) != 1 {
+					t.Fatalf("expected one rule, got %d", len(cfg.Rule))
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
-func TestLoadSnapshotRejectsEnabledMattermostWithoutBaseURL(t *testing.T) {
+func TestLoadSnapshotMattermostValidation(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.mattermost]
-enabled = true
-base_url = ""
-bot_token = "mm-bot-token"
-channel_id = "channel-123"
-timeout_sec = 2
-
-[[notify.mattermost.name-template]]
-name = "mm_default"
-message = "{{ .Message }}"
-
-[rule.mm]
-alert_type = "count_total"
-
-[rule.mm.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.mm.key]
-from_tags = ["dc"]
-
-[rule.mm.raise]
-n = 1
-
-[rule.mm.resolve]
-silence_sec = 5
-
-[[rule.mm.notify.route]]
-channel = "mattermost"
-template = "mm_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
+	tests := []struct {
+		name    string
+		section string
+		wantErr string
+		assert  func(*testing.T, Config)
+	}{
+		{
+			name:    "accept enabled mattermost",
+			section: mattermostNotifySection("https://mattermost.example", "mm-bot-token", "channel-123", 0, "mm_default", "[{{ .RuleName }}] {{ .State }}"),
+			assert: func(t *testing.T, cfg Config) {
+				t.Helper()
+				if !cfg.Notify.Mattermost.Enabled {
+					t.Fatalf("expected mattermost enabled")
+				}
+				if cfg.Notify.Mattermost.TimeoutSec != 10 {
+					t.Fatalf("expected default mattermost timeout=10, got %d", cfg.Notify.Mattermost.TimeoutSec)
+				}
+			},
+		},
+		{
+			name:    "reject missing base_url",
+			section: mattermostNotifySection("", "mm-bot-token", "channel-123", 2, "mm_default", "{{ .Message }}"),
+			wantErr: "notify.mattermost.base_url",
+		},
+		{
+			name:    "reject missing bot_token",
+			section: mattermostNotifySection("https://mattermost.example", "", "channel-123", 0, "mm_default", "{{ .Message }}"),
+			wantErr: "notify.mattermost.bot_token",
+		},
+		{
+			name:    "reject missing channel_id",
+			section: mattermostNotifySection("https://mattermost.example", "mm-bot-token", "", 0, "mm_default", "{{ .Message }}"),
+			wantErr: "notify.mattermost.channel_id",
+		},
 	}
-	if !strings.Contains(err.Error(), "notify.mattermost.base_url") {
-		t.Fatalf("unexpected error: %v", err)
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := loadSnapshotFromContent(t, joinSections(
+				serviceSection(""),
+				ingestHTTPEnabled,
+				tt.section,
+				countTotalRule(routeBlock("mattermost", "mm_default")),
+			))
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("load snapshot: %v", err)
+				}
+				if tt.assert != nil {
+					tt.assert(t, cfg)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
-func TestLoadSnapshotRejectsEnabledMattermostWithoutBotToken(t *testing.T) {
+func TestLoadSnapshotNATSIngestValidation(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
+	tests := []struct {
+		name       string
+		ingestNATS string
+		wantErr    string
+		assert     func(*testing.T, Config)
+	}{
+		{
+			name:       "applies nats ingest defaults",
+			ingestNATS: ingestNATSEnabled,
+			assert: func(t *testing.T, cfg Config) {
+				t.Helper()
+				if cfg.Ingest.NATS.Stream == "" || cfg.Ingest.NATS.ConsumerName == "" || cfg.Ingest.NATS.DeliverGroup == "" {
+					t.Fatalf("nats ingest defaults were not applied: %+v", cfg.Ingest.NATS)
+				}
+				if len(cfg.Ingest.NATS.URL) != 1 || cfg.Ingest.NATS.URL[0] != "nats://127.0.0.1:4222" {
+					t.Fatalf("unexpected nats ingest urls: %#v", cfg.Ingest.NATS.URL)
+				}
+				if cfg.Ingest.NATS.MaxDeliver == 0 || cfg.Ingest.NATS.AckWaitSec <= 0 || cfg.Ingest.NATS.MaxAckPending <= 0 {
+					t.Fatalf("unexpected nats ingest defaults: %+v", cfg.Ingest.NATS)
+				}
+				if cfg.Ingest.NATS.Workers != 1 {
+					t.Fatalf("unexpected nats ingest workers default: %d", cfg.Ingest.NATS.Workers)
+				}
+			},
+		},
+		{
+			name: "reject invalid max_deliver",
+			ingestNATS: `[ingest.nats]
 enabled = true
-
-[notify.mattermost]
+max_deliver = -2`,
+			wantErr: "ingest.nats.max_deliver",
+		},
+		{
+			name: "reject invalid workers",
+			ingestNATS: `[ingest.nats]
 enabled = true
-base_url = "https://mattermost.example"
-bot_token = ""
-channel_id = "channel-123"
-
-[[notify.mattermost.name-template]]
-name = "mm_default"
-message = "{{ .Message }}"
-
-[rule.mm]
-alert_type = "count_total"
-
-[rule.mm.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.mm.key]
-from_tags = ["dc"]
-
-[rule.mm.raise]
-n = 1
-
-[rule.mm.resolve]
-silence_sec = 5
-
-[[rule.mm.notify.route]]
-channel = "mattermost"
-template = "mm_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
+workers = -1`,
+			wantErr: "ingest.nats.workers",
+		},
 	}
-	if !strings.Contains(err.Error(), "notify.mattermost.bot_token") {
-		t.Fatalf("unexpected error: %v", err)
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := loadSnapshotFromContent(t, joinSections(
+				serviceSection(""),
+				ingestHTTPDisabled,
+				tt.ingestNATS,
+				telegramNotifySection("token", "chat", "", "tg_default", "{{ .Message }}"),
+				countTotalRule(routeBlock("telegram", "tg_default")),
+			))
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("load snapshot: %v", err)
+				}
+				if tt.assert != nil {
+					tt.assert(t, cfg)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
-func TestLoadSnapshotRejectsEnabledMattermostWithoutChannelID(t *testing.T) {
+func TestLoadSnapshotSingleModeBehavior(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.mattermost]
-enabled = true
-base_url = "https://mattermost.example"
-bot_token = "mm-bot-token"
-channel_id = ""
-
-[[notify.mattermost.name-template]]
-name = "mm_default"
-message = "{{ .Message }}"
-
-[rule.mm]
-alert_type = "count_total"
-
-[rule.mm.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.mm.key]
-from_tags = ["dc"]
-
-[rule.mm.raise]
-n = 1
-
-[rule.mm.resolve]
-silence_sec = 5
-
-[[rule.mm.notify.route]]
-channel = "mattermost"
-template = "mm_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
+	tests := []struct {
+		name    string
+		content string
+		wantErr string
+		assert  func(*testing.T, Config)
+	}{
+		{
+			name: "accept single mode without nats",
+			content: joinSections(
+				serviceSection("single"),
+				ingestHTTPListen,
+				httpNotifySection("http://127.0.0.1:1/notify", "http_default", "{{ .Message }}"),
+				countTotalRule(routeBlock("http", "http_default")),
+			),
+			assert: func(t *testing.T, cfg Config) {
+				t.Helper()
+				if cfg.Service.Mode != "single" {
+					t.Fatalf("unexpected service mode %q", cfg.Service.Mode)
+				}
+			},
+		},
+		{
+			name: "single mode auto-disables ingest nats",
+			content: joinSections(
+				serviceSection("single"),
+				ingestHTTPEnabled,
+				ingestNATSEnabled,
+				httpNotifySection("http://127.0.0.1:1/notify", "http_default", "{{ .Message }}"),
+				countTotalRule(routeBlock("http", "http_default")),
+			),
+			assert: func(t *testing.T, cfg Config) {
+				t.Helper()
+				if cfg.Ingest.NATS.Enabled {
+					t.Fatalf("expected ingest.nats.enabled=false in single mode")
+				}
+			},
+		},
+		{
+			name: "single mode auto-disables notify queue",
+			content: joinSections(
+				serviceSection("single"),
+				ingestHTTPEnabled,
+				`[notify.queue]
+enabled = true`,
+				httpNotifySection("http://127.0.0.1:1/notify", "http_default", "{{ .Message }}"),
+				countTotalRule(routeBlock("http", "http_default")),
+			),
+			assert: func(t *testing.T, cfg Config) {
+				t.Helper()
+				if cfg.Notify.Queue.Enabled {
+					t.Fatalf("expected notify.queue.enabled=false in single mode")
+				}
+			},
+		},
+		{
+			name: "reject single mode without http ingest",
+			content: joinSections(
+				serviceSection("single"),
+				ingestHTTPDisabled,
+				httpNotifySection("http://127.0.0.1:1/notify", "http_default", "{{ .Message }}"),
+				countTotalRule(routeBlock("http", "http_default")),
+			),
+			wantErr: "ingest.http.enabled",
+		},
 	}
-	if !strings.Contains(err.Error(), "notify.mattermost.channel_id") {
-		t.Fatalf("unexpected error: %v", err)
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := loadSnapshotFromContent(t, tt.content)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("load snapshot: %v", err)
+				}
+				if tt.assert != nil {
+					tt.assert(t, cfg)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
-func TestLoadSnapshotRejectsInvalidNotifyTemplate(t *testing.T) {
+func TestLoadSnapshotNotifyQueueValidation(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .AlertID "
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
-	}
-	if !strings.Contains(err.Error(), "notify.telegram.name-template[0].message") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLoadSnapshotAllowsFmtDurationTemplateFunc(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "delta={{ fmtDuration .Duration }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	if _, err := LoadSnapshot(ConfigSource{File: path}); err != nil {
-		t.Fatalf("load snapshot: %v", err)
-	}
-}
-
-func TestLoadSnapshotAppliesNATSIngestDefaults(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = false
-
-[ingest.nats]
-enabled = true
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	cfg, err := LoadSnapshot(ConfigSource{File: path})
-	if err != nil {
-		t.Fatalf("load snapshot: %v", err)
-	}
-	if cfg.Ingest.NATS.Stream == "" || cfg.Ingest.NATS.ConsumerName == "" || cfg.Ingest.NATS.DeliverGroup == "" {
-		t.Fatalf("nats ingest defaults were not applied: %+v", cfg.Ingest.NATS)
-	}
-	if len(cfg.Ingest.NATS.URL) != 1 || cfg.Ingest.NATS.URL[0] != "nats://127.0.0.1:4222" {
-		t.Fatalf("unexpected nats ingest urls: %#v", cfg.Ingest.NATS.URL)
-	}
-	if cfg.Ingest.NATS.MaxDeliver == 0 || cfg.Ingest.NATS.AckWaitSec <= 0 || cfg.Ingest.NATS.MaxAckPending <= 0 {
-		t.Fatalf("unexpected nats ingest defaults: %+v", cfg.Ingest.NATS)
-	}
-	if cfg.Ingest.NATS.Workers != 1 {
-		t.Fatalf("unexpected nats ingest workers default: %d", cfg.Ingest.NATS.Workers)
-	}
-}
-
-func TestLoadSnapshotAcceptsSingleModeWithoutNATS(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-mode = "single"
-
-[ingest.http]
-enabled = true
-listen = "127.0.0.1:18081"
-
-[notify.http]
-enabled = true
-url = "http://127.0.0.1:1/notify"
-
-[[notify.http.name-template]]
-name = "http_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "http"
-template = "http_default"
-`
-	writeConfigFile(t, path, content)
-
-	cfg, err := LoadSnapshot(ConfigSource{File: path})
-	if err != nil {
-		t.Fatalf("load snapshot: %v", err)
-	}
-	if cfg.Service.Mode != "single" {
-		t.Fatalf("unexpected service mode %q", cfg.Service.Mode)
-	}
-}
-
-func TestLoadSnapshotSingleModeAutoDisablesNATSIngest(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-mode = "single"
-
-[ingest.http]
-enabled = true
-
-[ingest.nats]
-enabled = true
-
-[notify.http]
-enabled = true
-url = "http://127.0.0.1:1/notify"
-
-[[notify.http.name-template]]
-name = "http_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "http"
-template = "http_default"
-`
-	writeConfigFile(t, path, content)
-
-	cfg, err := LoadSnapshot(ConfigSource{File: path})
-	if err != nil {
-		t.Fatalf("load snapshot: %v", err)
-	}
-	if cfg.Ingest.NATS.Enabled {
-		t.Fatalf("expected ingest.nats.enabled=false in single mode")
-	}
-}
-
-func TestLoadSnapshotSingleModeAutoDisablesNotifyQueue(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-mode = "single"
-
-[ingest.http]
-enabled = true
-
-[notify.queue]
-enabled = true
-
-[notify.http]
-enabled = true
-url = "http://127.0.0.1:1/notify"
-
-[[notify.http.name-template]]
-name = "http_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "http"
-template = "http_default"
-`
-	writeConfigFile(t, path, content)
-
-	cfg, err := LoadSnapshot(ConfigSource{File: path})
-	if err != nil {
-		t.Fatalf("load snapshot: %v", err)
-	}
-	if cfg.Notify.Queue.Enabled {
-		t.Fatalf("expected notify.queue.enabled=false in single mode")
-	}
-}
-
-func TestLoadSnapshotRejectsSingleModeWithoutHTTPIngest(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-mode = "single"
-
-[ingest.http]
-enabled = false
-
-[notify.http]
-enabled = true
-url = "http://127.0.0.1:1/notify"
-
-[[notify.http.name-template]]
-name = "http_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "http"
-template = "http_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
-	}
-	if !strings.Contains(err.Error(), "ingest.http.enabled") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLoadSnapshotRejectsInvalidNATSIngestMaxDeliver(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = false
-
-[ingest.nats]
-enabled = true
-max_deliver = -2
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
-	}
-	if !strings.Contains(err.Error(), "ingest.nats.max_deliver") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLoadSnapshotRejectsInvalidNATSIngestWorkers(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = false
-
-[ingest.nats]
-enabled = true
-workers = -1
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
-	}
-	if !strings.Contains(err.Error(), "ingest.nats.workers") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLoadSnapshotAcceptsEnabledNotifyQueue(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.queue]
+	tests := []struct {
+		name         string
+		notifyQueue  string
+		wantErr      string
+		assertLoaded func(*testing.T, Config)
+	}{
+		{
+			name: "accept enabled queue",
+			notifyQueue: `[notify.queue]
 enabled = true
 ack_wait_sec = 10
 nack_delay_ms = 100
 max_deliver = 3
-max_ack_pending = 100
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	cfg, err := LoadSnapshot(ConfigSource{File: path})
-	if err != nil {
-		t.Fatalf("load snapshot: %v", err)
-	}
-	if !cfg.Notify.Queue.Enabled {
-		t.Fatalf("expected queue enabled")
-	}
-}
-
-func TestLoadSnapshotAppliesNotifyQueueDefaultsWhenEnabled(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.queue]
-enabled = true
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	cfg, err := LoadSnapshot(ConfigSource{File: path})
-	if err != nil {
-		t.Fatalf("load snapshot: %v", err)
-	}
-	if !cfg.Notify.Queue.Enabled {
-		t.Fatalf("expected queue enabled")
-	}
-	if cfg.Notify.Queue.AckWaitSec <= 0 {
-		t.Fatalf("expected positive queue ack wait, got %d", cfg.Notify.Queue.AckWaitSec)
-	}
-	if cfg.Notify.Queue.MaxAckPending <= 0 {
-		t.Fatalf("expected positive queue max ack pending, got %d", cfg.Notify.Queue.MaxAckPending)
-	}
-	if len(cfg.Notify.Queue.URL) != 1 || cfg.Notify.Queue.URL[0] != "nats://127.0.0.1:4222" {
-		t.Fatalf("unexpected notify queue urls: %#v", cfg.Notify.Queue.URL)
-	}
-	if cfg.Notify.Queue.DLQ {
-		t.Fatalf("expected queue dlq disabled by default")
-	}
-}
-
-func TestLoadSnapshotAcceptsEnabledNotifyQueueDLQ(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.queue]
+max_ack_pending = 100`,
+			assertLoaded: func(t *testing.T, cfg Config) {
+				t.Helper()
+				if !cfg.Notify.Queue.Enabled {
+					t.Fatalf("expected queue enabled")
+				}
+			},
+		},
+		{
+			name: "apply queue defaults when enabled",
+			notifyQueue: `[notify.queue]
+enabled = true`,
+			assertLoaded: func(t *testing.T, cfg Config) {
+				t.Helper()
+				if !cfg.Notify.Queue.Enabled {
+					t.Fatalf("expected queue enabled")
+				}
+				if cfg.Notify.Queue.AckWaitSec <= 0 {
+					t.Fatalf("expected positive queue ack wait, got %d", cfg.Notify.Queue.AckWaitSec)
+				}
+				if cfg.Notify.Queue.MaxAckPending <= 0 {
+					t.Fatalf("expected positive queue max ack pending, got %d", cfg.Notify.Queue.MaxAckPending)
+				}
+				if len(cfg.Notify.Queue.URL) != 1 || cfg.Notify.Queue.URL[0] != "nats://127.0.0.1:4222" {
+					t.Fatalf("unexpected notify queue urls: %#v", cfg.Notify.Queue.URL)
+				}
+				if cfg.Notify.Queue.DLQ {
+					t.Fatalf("expected queue dlq disabled by default")
+				}
+			},
+		},
+		{
+			name: "accept queue dlq enabled",
+			notifyQueue: `[notify.queue]
 enabled = true
 dlq = true
 ack_wait_sec = 10
 nack_delay_ms = 100
 max_deliver = 3
-max_ack_pending = 100
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	cfg, err := LoadSnapshot(ConfigSource{File: path})
-	if err != nil {
-		t.Fatalf("load snapshot: %v", err)
-	}
-	if !cfg.Notify.Queue.DLQ {
-		t.Fatalf("expected queue dlq enabled")
-	}
-}
-
-func TestLoadSnapshotRejectsNotifyQueueDLQWhenQueueDisabled(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.queue]
+max_ack_pending = 100`,
+			assertLoaded: func(t *testing.T, cfg Config) {
+				t.Helper()
+				if !cfg.Notify.Queue.DLQ {
+					t.Fatalf("expected queue dlq enabled")
+				}
+			},
+		},
+		{
+			name: "reject dlq when queue disabled",
+			notifyQueue: `[notify.queue]
 enabled = false
-dlq = true
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
-	}
-	if !strings.Contains(err.Error(), "notify.queue.dlq requires notify.queue.enabled=true") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLoadSnapshotRejectsDeprecatedNotifyQueueDLQSection(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.queue]
+dlq = true`,
+			wantErr: "notify.queue.dlq requires notify.queue.enabled=true",
+		},
+		{
+			name: "reject deprecated notify.queue.dlq section",
+			notifyQueue: `[notify.queue]
 enabled = true
 ack_wait_sec = 10
 nack_delay_ms = 100
@@ -1193,291 +455,108 @@ max_deliver = 3
 max_ack_pending = 100
 
 [notify.queue.dlq]
+enabled = true`,
+			wantErr: "[notify.queue.dlq] section is not supported",
+		},
+		{
+			name: "reject deprecated notify.queue.url",
+			notifyQueue: `[notify.queue]
 enabled = true
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
+url = ["nats://127.0.0.1:4222"]`,
+			wantErr: "notify.queue.url is not supported",
+		},
 	}
-	if !strings.Contains(err.Error(), "[notify.queue.dlq] section is not supported") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
 
-func TestLoadSnapshotRejectsDeprecatedNotifyQueueURL(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.queue]
-enabled = true
-url = ["nats://127.0.0.1:4222"]
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
-	}
-	if !strings.Contains(err.Error(), "notify.queue.url is not supported") {
-		t.Fatalf("unexpected error: %v", err)
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := loadSnapshotFromContent(t, joinSections(
+				serviceSection(""),
+				ingestHTTPEnabled,
+				tt.notifyQueue,
+				telegramNotifySection("token", "chat", "", "tg_default", "{{ .Message }}"),
+				countTotalRule(routeBlock("telegram", "tg_default")),
+			))
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("load snapshot: %v", err)
+				}
+				if tt.assertLoaded != nil {
+					tt.assertLoaded(t, cfg)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
 func TestLoadSnapshotRejectsDeprecatedIngestNATSRoutingKeys(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[ingest.nats]
+	err := loadSnapshotErr(t, joinSections(
+		serviceSection(""),
+		ingestHTTPEnabled,
+		`[ingest.nats]
 enabled = true
 url = ["nats://127.0.0.1:4222"]
-subject = "alerting.events"
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
-	}
+subject = "alerting.events"`,
+		telegramNotifySection("token", "chat", "", "tg_default", "{{ .Message }}"),
+		countTotalRule(routeBlock("telegram", "tg_default")),
+	))
 	if !strings.Contains(err.Error(), "ingest.nats.subject/stream/consumer_name/deliver_group are fixed in runtime") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-func TestLoadSnapshotAcceptsEnabledJiraTracker(t *testing.T) {
+func TestLoadSnapshotJiraValidation(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.jira]
-enabled = true
-base_url = "https://jira.example.com"
-timeout_sec = 10
-
-[notify.jira.auth]
-type = "basic"
-username = "user@example.com"
-password = "token"
-
-[notify.jira.create]
-method = "POST"
-path = "/rest/api/3/issue"
-body_template = "{\"summary\": {{ json .Message }}}"
-success_status = [201]
-ref_json_path = "key"
-
-[notify.jira.resolve]
-method = "POST"
-path = "/rest/api/3/issue/{{ .ExternalRef }}/transitions"
-body_template = "{\"transition\":{\"id\":\"31\"}}"
-success_status = [204]
-
-[[notify.jira.name-template]]
-name = "jira_default"
-message = "[{{ .RuleName }}] {{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "jira"
-template = "jira_default"
-`
-	writeConfigFile(t, path, content)
-
-	if _, err := LoadSnapshot(ConfigSource{File: path}); err != nil {
-		t.Fatalf("load snapshot: %v", err)
+	tests := []struct {
+		name    string
+		jira    string
+		wantErr string
+	}{
+		{
+			name: "accept enabled jira",
+			jira: jiraNotifySection(true),
+		},
+		{
+			name:    "reject jira without create ref path",
+			jira:    jiraNotifySection(false),
+			wantErr: "notify.jira.create.ref_json_path",
+		},
 	}
-}
 
-func TestLoadSnapshotRejectsJiraWithoutCreateRefPath(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.jira]
-enabled = true
-base_url = "https://jira.example.com"
-timeout_sec = 10
-
-[notify.jira.create]
-method = "POST"
-path = "/rest/api/3/issue"
-success_status = [201]
-
-[notify.jira.resolve]
-method = "POST"
-path = "/rest/api/3/issue/{{ .ExternalRef }}/transitions"
-success_status = [204]
-
-[[notify.jira.name-template]]
-name = "jira_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "jira"
-template = "jira_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected validation error")
-	}
-	if !strings.Contains(err.Error(), "notify.jira.create.ref_json_path") {
-		t.Fatalf("unexpected error: %v", err)
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := loadSnapshotFromContent(t, joinSections(
+				serviceSection(""),
+				ingestHTTPEnabled,
+				tt.jira,
+				countTotalRule(routeBlock("jira", "jira_default")),
+			))
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("load snapshot: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
@@ -1536,35 +615,31 @@ func TestLoadDirNotifyExplicitFalseOverrides(t *testing.T) {
 	t.Parallel()
 
 	tmpDir := t.TempDir()
-	writeConfigFile(t, filepath.Join(tmpDir, "a.toml"), `
-[notify]
+	writeConfigFile(t, filepath.Join(tmpDir, "a.toml"), joinSections(
+		`[notify]
 repeat = true
 repeat_per_channel = true
-on_pending = true
-
-[notify.telegram]
+on_pending = true`,
+		`[notify.telegram]
 enabled = true
 bot_token = "token-a"
-chat_id = "chat-a"
-
-[notify.mattermost]
+chat_id = "chat-a"`,
+		`[notify.mattermost]
 enabled = true
 base_url = "https://mattermost.example"
 bot_token = "token-a"
-channel_id = "channel-a"
-`)
-	writeConfigFile(t, filepath.Join(tmpDir, "b.toml"), `
-[notify]
+channel_id = "channel-a"`,
+	))
+	writeConfigFile(t, filepath.Join(tmpDir, "b.toml"), joinSections(
+		`[notify]
 repeat = false
 repeat_per_channel = false
-on_pending = false
-
-[notify.telegram]
-enabled = false
-
-[notify.mattermost]
-enabled = false
-`)
+on_pending = false`,
+		`[notify.telegram]
+enabled = false`,
+		`[notify.mattermost]
+enabled = false`,
+	))
 
 	cfg, err := loadDir(tmpDir)
 	if err != nil {
@@ -1597,28 +672,21 @@ enabled = false
 	}
 }
 
-func TestLoadSnapshotRejectsLegacyRuleArraySyntax(t *testing.T) {
+func TestLoadSnapshotRejectsUnsupportedSyntax(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[[rule]]
+	tests := []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{
+			name: "legacy rule array syntax",
+			content: joinSections(
+				serviceSection(""),
+				ingestHTTPEnabled,
+				telegramNotifySection("token", "chat", "", "tg_default", "{{ .Message }}"),
+				`[[rule]]
 name = "legacy_ct"
 alert_type = "count_total"
 
@@ -1638,101 +706,30 @@ silence_sec = 5
 
 [[rule.notify.route]]
 channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected legacy rule format error")
-	}
-	if !strings.Contains(err.Error(), "legacy [[rule]] format is not supported") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLoadSnapshotRejectsStateSectionSyntax(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[ingest.nats]
-enabled = false
-
-[state.nats]
+template = "tg_default"`,
+			),
+			wantErr: "legacy [[rule]] format is not supported",
+		},
+		{
+			name: "state section syntax",
+			content: joinSections(
+				serviceSection(""),
+				ingestHTTPEnabled,
+				`[state.nats]
 url = ["nats://127.0.0.1:4222"]
-tick_bucket = "tick_custom"
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected unsupported state section error")
-	}
-	if !strings.Contains(err.Error(), "state configuration is not supported") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLoadSnapshotRejectsRuleBodyNameField(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "chat"
-
-[[notify.telegram.name-template]]
-name = "tg_default"
-message = "{{ .Message }}"
-
-[rule.ct]
+tick_bucket = "tick_custom"`,
+				telegramNotifySection("token", "chat", "", "tg_default", "{{ .Message }}"),
+				countTotalRule(routeBlock("telegram", "tg_default")),
+			),
+			wantErr: "state configuration is not supported",
+		},
+		{
+			name: "rule body name field",
+			content: joinSections(
+				serviceSection(""),
+				ingestHTTPEnabled,
+				telegramNotifySection("token", "chat", "", "tg_default", "{{ .Message }}"),
+				`[rule.ct]
 name = "ct"
 alert_type = "count_total"
 
@@ -1752,138 +749,242 @@ silence_sec = 5
 
 [[rule.ct.notify.route]]
 channel = "telegram"
-template = "tg_default"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
-	if err == nil {
-		t.Fatalf("expected name field error")
+template = "tg_default"`,
+			),
+			wantErr: "rule.ct.name is not supported",
+		},
 	}
-	if !strings.Contains(err.Error(), "rule.ct.name is not supported") {
-		t.Fatalf("unexpected error: %v", err)
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := loadSnapshotErr(t, tt.content)
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
-func TestLoadSnapshotAcceptsMessengerDualRoutesWithActiveOnly(t *testing.T) {
+func TestLoadSnapshotMessengerRoutesValidation(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "history-chat"
-active_chat_id = "active-chat"
-
-[[notify.telegram.name-template]]
-name = "tg_history"
-message = "history {{ .State }}"
-
-[[notify.telegram.name-template]]
+	tests := []struct {
+		name    string
+		content string
+		wantErr string
+		assert  func(*testing.T, Config)
+	}{
+		{
+			name: "accept dual routes with active_only",
+			content: joinSections(
+				serviceSection(""),
+				ingestHTTPEnabled,
+				telegramNotifySection("token", "history-chat", "active-chat", "tg_history", "history {{ .State }}"),
+				`[[notify.telegram.name-template]]
 name = "tg_active"
-message = "active {{ .State }}"
+message = "active {{ .State }}"`,
+				countTotalRule(
+					routeBlock("telegram", "tg_history", `name = "telegram_history"`, `mode = "history"`),
+					routeBlock("telegram", "tg_active", `name = "telegram_active"`, `mode = "active_only"`),
+				),
+			),
+			assert: func(t *testing.T, cfg Config) {
+				t.Helper()
+				if len(cfg.Rule) != 1 || len(cfg.Rule[0].Notify.Route) != 2 {
+					t.Fatalf("unexpected routes: %+v", cfg.Rule)
+				}
+			},
+		},
+		{
+			name: "reject active_only without active destination",
+			content: joinSections(
+				serviceSection(""),
+				ingestHTTPEnabled,
+				telegramNotifySection("token", "history-chat", "", "tg_active", "active {{ .State }}"),
+				countTotalRule(routeBlock("telegram", "tg_active", `name = "telegram_active"`, `mode = "active_only"`)),
+			),
+			wantErr: "active_chat_id",
+		},
+	}
 
-[rule.ct]
-alert_type = "count_total"
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := loadSnapshotFromContent(t, tt.content)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("load snapshot: %v", err)
+				}
+				if tt.assert != nil {
+					tt.assert(t, cfg)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
 
-[rule.ct.match]
+func serviceSection(mode string) string {
+	if mode == "" {
+		return `[service]
+name = "alerting"`
+	}
+	return fmt.Sprintf(`[service]
+name = "alerting"
+mode = %q`, mode)
+}
+
+func countTotalRule(routeBlocks ...string) string {
+	sections := []string{
+		`[rule.ct]
+alert_type = "count_total"`,
+		`[rule.ct.match]
 type = ["event"]
 var = ["errors"]
-tags = { dc = ["dc1"] }
+tags = { dc = ["dc1"] }`,
+		`[rule.ct.key]
+from_tags = ["dc"]`,
+		`[rule.ct.raise]
+n = 1`,
+		`[rule.ct.resolve]
+silence_sec = 5`,
+	}
+	sections = append(sections, routeBlocks...)
+	return joinSections(sections...)
+}
 
-[rule.ct.key]
-from_tags = ["dc"]
+func routeBlock(channel, template string, extras ...string) string {
+	lines := []string{
+		"[[rule.ct.notify.route]]",
+		fmt.Sprintf("channel = %q", channel),
+		fmt.Sprintf("template = %q", template),
+	}
+	lines = append(lines, extras...)
+	return strings.Join(lines, "\n")
+}
 
-[rule.ct.raise]
-n = 1
+func telegramNotifySection(botToken, chatID, activeChatID, templateName, message string) string {
+	lines := []string{
+		"[notify.telegram]",
+		"enabled = true",
+		fmt.Sprintf("bot_token = %q", botToken),
+		fmt.Sprintf("chat_id = %q", chatID),
+	}
+	if activeChatID != "" {
+		lines = append(lines, fmt.Sprintf("active_chat_id = %q", activeChatID))
+	}
+	return joinSections(
+		strings.Join(lines, "\n"),
+		fmt.Sprintf(`[[notify.telegram.name-template]]
+name = %q
+message = %q`, templateName, message),
+	)
+}
 
-[rule.ct.resolve]
-silence_sec = 5
+func mattermostNotifySection(baseURL, botToken, channelID string, timeoutSec int, templateName, message string) string {
+	lines := []string{
+		"[notify.mattermost]",
+		"enabled = true",
+		fmt.Sprintf("base_url = %q", baseURL),
+		fmt.Sprintf("bot_token = %q", botToken),
+		fmt.Sprintf("channel_id = %q", channelID),
+	}
+	if timeoutSec > 0 {
+		lines = append(lines, fmt.Sprintf("timeout_sec = %d", timeoutSec))
+	}
+	return joinSections(
+		strings.Join(lines, "\n"),
+		fmt.Sprintf(`[[notify.mattermost.name-template]]
+name = %q
+message = %q`, templateName, message),
+	)
+}
 
-[[rule.ct.notify.route]]
-name = "telegram_history"
-channel = "telegram"
-template = "tg_history"
-mode = "history"
+func httpNotifySection(url, templateName, message string) string {
+	return joinSections(
+		fmt.Sprintf(`[notify.http]
+enabled = true
+url = %q`, url),
+		fmt.Sprintf(`[[notify.http.name-template]]
+name = %q
+message = %q`, templateName, message),
+	)
+}
 
-[[rule.ct.notify.route]]
-name = "telegram_active"
-channel = "telegram"
-template = "tg_active"
-mode = "active_only"
-`
-	writeConfigFile(t, path, content)
+func jiraNotifySection(withRefPath bool) string {
+	create := `[notify.jira.create]
+method = "POST"
+path = "/rest/api/3/issue"
+body_template = "{\"summary\": {{ json .Message }}}"
+success_status = [201]`
+	if withRefPath {
+		create += "\nref_json_path = \"key\""
+	}
+	return joinSections(
+		`[notify.jira]
+enabled = true
+base_url = "https://jira.example.com"
+timeout_sec = 10`,
+		`[notify.jira.auth]
+type = "basic"
+username = "user@example.com"
+password = "token"`,
+		create,
+		`[notify.jira.resolve]
+method = "POST"
+path = "/rest/api/3/issue/{{ .ExternalRef }}/transitions"
+body_template = "{\"transition\":{\"id\":\"31\"}}"
+success_status = [204]`,
+		`[[notify.jira.name-template]]
+name = "jira_default"
+message = "[{{ .RuleName }}] {{ .Message }}"`,
+	)
+}
 
-	cfg, err := LoadSnapshot(ConfigSource{File: path})
+func mustLoadSnapshot(t *testing.T, content string) Config {
+	t.Helper()
+	cfg, err := loadSnapshotFromContent(t, content)
 	if err != nil {
 		t.Fatalf("load snapshot: %v", err)
 	}
-	if len(cfg.Rule) != 1 || len(cfg.Rule[0].Notify.Route) != 2 {
-		t.Fatalf("unexpected routes: %+v", cfg.Rule)
-	}
+	return cfg
 }
 
-func TestLoadSnapshotRejectsActiveOnlyWithoutActiveDestination(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "config.toml")
-	content := `
-[service]
-name = "alerting"
-
-[ingest.http]
-enabled = true
-
-[notify.telegram]
-enabled = true
-bot_token = "token"
-chat_id = "history-chat"
-
-[[notify.telegram.name-template]]
-name = "tg_active"
-message = "active {{ .State }}"
-
-[rule.ct]
-alert_type = "count_total"
-
-[rule.ct.match]
-type = ["event"]
-var = ["errors"]
-tags = { dc = ["dc1"] }
-
-[rule.ct.key]
-from_tags = ["dc"]
-
-[rule.ct.raise]
-n = 1
-
-[rule.ct.resolve]
-silence_sec = 5
-
-[[rule.ct.notify.route]]
-name = "telegram_active"
-channel = "telegram"
-template = "tg_active"
-mode = "active_only"
-`
-	writeConfigFile(t, path, content)
-
-	_, err := LoadSnapshot(ConfigSource{File: path})
+func loadSnapshotErr(t *testing.T, content string) error {
+	t.Helper()
+	_, err := loadSnapshotFromContent(t, content)
 	if err == nil {
 		t.Fatalf("expected validation error")
 	}
-	if !strings.Contains(err.Error(), "active_chat_id") {
-		t.Fatalf("unexpected error: %v", err)
+	return err
+}
+
+func loadSnapshotFromContent(t *testing.T, content string) (Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	writeConfigFile(t, path, content)
+	return LoadSnapshot(ConfigSource{File: path})
+}
+
+func joinSections(parts ...string) string {
+	nonEmpty := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		nonEmpty = append(nonEmpty, trimmed)
 	}
+	return strings.Join(nonEmpty, "\n\n") + "\n"
 }
 
 func boolPtr(value bool) *bool {

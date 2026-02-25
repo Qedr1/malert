@@ -37,6 +37,8 @@ tagg_sec = 60
 # Порог гашения: если после последнего события тишина silence_sec секунд -> resolved.
 # Гашение по тишине входящих событий.
 silence_sec = 120
+# Дополнительный гистерезис перед resolved (сек).
+hysteresis_sec = 0
 
 [rule.cw_telegram_live.pending]
 # Включает стадию pending перед firing.

@@ -1,9 +1,9 @@
 # Алертинг
 ### Стек 
 - Go (1.23.1+)
-- [ NATS Server JetStream (2.12.4+) ]
-- [ ClickHouse (25.11+) ]
-  
+- Опционально NATS Server JetStream (2.12.4+)
+- Опционально ClickHouse (25.11+)
+
 ## Сценарии использования
 После этапа агрегации входящих событий согласно типу алертов, сервис принимает решение 
 - поднять алерт
@@ -19,12 +19,12 @@
 
 ### Произвольный 
 Предполагает формирование агрегатов на стороне самих сервисов и доставку их в алертинг через nats или HTTP
+
 ## Режимы работы (single vs multi)
 #### single-instance
 Может быть запущена одна копия сервиса c единственных входящим каналом событий по HTTP
 #### multi-instance 
 Произвольное нечетное количество сервисов с межсервисной синхронизацией и дополнительным входящим каналом через NATS
-
 | Характеристика | single-instance | multi-instance |
 |---|---|---|
 | Выбор режима | service.mode=single | service.mode=nats (default) |
@@ -77,6 +77,7 @@
 | count_window | 2 447 | 382 404 | 413 736 |
 | missing_heartbeat | 2 583 | 388 332 | 416 613 |
 
+
 # Принцип работы
 ```    
                    [ jira ] [ youtrack ] [ muttermost ] [ telegram ]
@@ -88,10 +89,10 @@
                                 mALERT_1 … mALERT_N 
                                     ▲            ▲
                                     |            |
-[ vector ] ──► [ ClickHouse ] ──► nats     http_server 
+[ vector ] ──► [ ClickHouse ] ──► [ nats ]     http_server 
     ▲                ▲              ▲            ▲
     |                |              |            |
-[ mAGENT ]      [ serv1 ]         servnN      servnN+1
+[ mAGENT ]      [ serv1 ]        [ servN ]     servN+1
 
 mAGENT https://github.com/Qedr1/magent
  ```
@@ -122,8 +123,8 @@ pending опционален (pending.enabled, pending.delay_sec).
 - single-instance: in-memory (без NATS KV).
 
 8. Закрытие алерта:
-- для count_total и count_window: по resolve.silence_sec,
-- для missing_heartbeat: по raise.missing_sec и при возврате heartbeat,
+- для count_total и count_window: по resolve.silence_sec + resolve.hysteresis_sec,
+- для missing_heartbeat: по raise.missing_sec и подтвержденному возврату heartbeat (resolve.hysteresis_sec),
 - также по факту TTL-удаления tick (delete marker).
 
 9. Уведомления:
@@ -246,11 +247,12 @@ UP:
 
 DOWN:
 - обновляем last_seen[KEY] = now на каждом срабатывании
-- если now - last_seen[KEY] >= silence_sec → RESOLVED(KEY)
+- если now - last_seen[KEY] >= silence_sec + hysteresis_sec → RESOLVED(KEY)
 
 Обязательные параметры (конфиг):
 - raise.n >= 1
 - resolve.silence_sec >= 0
+- resolve.hysteresis_sec >= 0
 
 Запрещённые параметры (конфиг):
 - raise.tagg_sec
@@ -267,13 +269,14 @@ UP:
 - если W[KEY] >= N → FIRING(KEY) (или PENDING(KEY) -> FIRING(KEY), если включен pending)
 
 DOWN:
-- если now - last_seen[KEY] >= silence_sec → RESOLVED(KEY)
+- если now - last_seen[KEY] >= silence_sec + hysteresis_sec → RESOLVED(KEY)
 - обычно resolve.silence_sec = raise.tagg_sec, но допускается отдельное значение
 
 Обязательные параметры (конфиг):
 - raise.n >= 1
 - raise.tagg_sec > 0
 - resolve.silence_sec >= 0
+- resolve.hysteresis_sec >= 0
 
 Запрещённые параметры (конфиг):
 - raise.missing_sec
@@ -289,11 +292,15 @@ UP:
 - если now - last_seen[KEY] >= missing_sec → FIRING(KEY) (или PENDING(KEY) -> FIRING(KEY), если включен pending)
 
 DOWN:
-- при первом новом срабатывании (прошедшем фильтр) → RESOLVED(KEY)
-- одновременно last_seen[KEY] = now
+- при новом heartbeat начинается окно восстановления resolve.hysteresis_sec
+- если heartbeat стабилен весь интервал resolve.hysteresis_sec → RESOLVED(KEY)
+- если heartbeat снова пропал до конца окна, восстановление сбрасывается (флап-защита)
 
 Обязательные параметры (конфиг):
 - raise.missing_sec > 0
+
+Параметры resolve (конфиг):
+- resolve.hysteresis_sec >= 0 (0 = мгновенный resolved на первом heartbeat)
 
 Запрещённые параметры (конфиг):
 - raise.n

@@ -14,22 +14,23 @@ import (
 // Params: counters, time windows, and lifecycle markers.
 // Returns: mutable state used by rule engine.
 type RuntimeState struct {
-	RuleName       string
-	AlertID        string
-	Var            string
-	Tags           map[string]string
-	MetricValue    string
-	RaisedAt       time.Time
-	Initialized    bool
-	LastSeen       time.Time
-	PendingSince   *time.Time
-	CurrentState   domain.AlertState
-	CountTotal     int64
-	CountWindow    []WindowPoint
-	CountWindowSum int64
-	LastNotified   map[string]time.Time
-	ChannelRefs    map[string]int
-	ExternalRefs   map[string]string
+	RuleName        string
+	AlertID         string
+	Var             string
+	Tags            map[string]string
+	MetricValue     string
+	RaisedAt        time.Time
+	Initialized     bool
+	LastSeen        time.Time
+	PendingSince    *time.Time
+	HysteresisSince *time.Time
+	CurrentState    domain.AlertState
+	CountTotal      int64
+	CountWindow     []WindowPoint
+	CountWindowSum  int64
+	LastNotified    map[string]time.Time
+	ChannelRefs     map[string]int
+	ExternalRefs    map[string]string
 }
 
 // AlertIdentity stores immutable alert dimensions used in notifications/card writes.
@@ -104,9 +105,25 @@ func (e *Engine) ProcessEvent(rule config.RuleConfig, event domain.Event, alertI
 			state.Initialized = true
 			state.CurrentState = ""
 			state.PendingSince = nil
+			state.HysteresisSince = nil
 			return domain.Decision{Matched: true, AlertID: alertID}
 		}
 		if state.CurrentState == domain.AlertStatePending || state.CurrentState == domain.AlertStateFiring {
+			hysteresisWindow := time.Duration(rule.Resolve.HysteresisSec) * time.Second
+			if hysteresisWindow > 0 {
+				if state.HysteresisSince == nil {
+					hysteresisSince := now
+					state.HysteresisSince = &hysteresisSince
+				}
+				if now.Sub(*state.HysteresisSince) < hysteresisWindow {
+					return domain.Decision{
+						Matched:     true,
+						AlertID:     alertID,
+						State:       state.CurrentState,
+						ShouldStore: true,
+					}
+				}
+			}
 			decision := domain.Decision{
 				Matched:          true,
 				AlertID:          alertID,
@@ -115,11 +132,9 @@ func (e *Engine) ProcessEvent(rule config.RuleConfig, event domain.Event, alertI
 				ShouldStore:      true,
 				ShouldNotify:     true,
 				ResolveImmediate: true,
-				ResolveCause:     "heartbeat_received",
+				ResolveCause:     "heartbeat_recovered",
 			}
-			state.CurrentState = ""
-			state.PendingSince = nil
-			state.RaisedAt = time.Time{}
+			resetResolvedState(state)
 			return decision
 		}
 		return domain.Decision{Matched: true, AlertID: alertID}
@@ -155,7 +170,8 @@ func (e *Engine) TickRuleWithFiring(rule config.RuleConfig, now time.Time) ([]do
 			if state.CurrentState != domain.AlertStatePending && state.CurrentState != domain.AlertStateFiring {
 				continue
 			}
-			if now.Sub(state.LastSeen) >= time.Duration(rule.Resolve.SilenceSec)*time.Second {
+			resolveAfter := time.Duration(rule.Resolve.SilenceSec+rule.Resolve.HysteresisSec) * time.Second
+			if now.Sub(state.LastSeen) >= resolveAfter {
 				decision := domain.Decision{
 					Matched:      true,
 					AlertID:      state.AlertID,
@@ -165,12 +181,7 @@ func (e *Engine) TickRuleWithFiring(rule config.RuleConfig, now time.Time) ([]do
 					ShouldNotify: true,
 					ResolveCause: "silence_timeout",
 				}
-				state.CurrentState = ""
-				state.PendingSince = nil
-				state.CountWindow = nil
-				state.CountWindowSum = 0
-				state.CountTotal = 0
-				state.RaisedAt = time.Time{}
+				resetResolvedState(state)
 				decisions = append(decisions, decision)
 			}
 		case "missing_heartbeat":
@@ -178,10 +189,47 @@ func (e *Engine) TickRuleWithFiring(rule config.RuleConfig, now time.Time) ([]do
 				continue
 			}
 			active := now.Sub(state.LastSeen) >= time.Duration(rule.Raise.MissingSec)*time.Second
+			if active {
+				state.HysteresisSince = nil
+			}
 			decision := e.applyActiveCondition(state, rule, now, active, true, "")
 			if decision.Matched {
 				decisions = append(decisions, decision)
 			}
+			if active || (state.CurrentState != domain.AlertStatePending && state.CurrentState != domain.AlertStateFiring) {
+				continue
+			}
+
+			hysteresisWindow := time.Duration(rule.Resolve.HysteresisSec) * time.Second
+			if hysteresisWindow <= 0 {
+				continue
+			}
+			if state.HysteresisSince == nil {
+				hysteresisSince := state.LastSeen
+				if hysteresisSince.IsZero() {
+					hysteresisSince = now
+				}
+				state.HysteresisSince = &hysteresisSince
+			}
+			if now.Sub(*state.HysteresisSince) >= hysteresisWindow {
+				decisions = append(decisions, domain.Decision{
+					Matched:      true,
+					AlertID:      state.AlertID,
+					State:        domain.AlertStateResolved,
+					StateChanged: true,
+					ShouldStore:  true,
+					ShouldNotify: true,
+					ResolveCause: "heartbeat_recovered",
+				})
+				resetResolvedState(state)
+				continue
+			}
+			decisions = append(decisions, domain.Decision{
+				Matched:     true,
+				AlertID:     state.AlertID,
+				State:       state.CurrentState,
+				ShouldStore: true,
+			})
 		}
 		if state.CurrentState == domain.AlertStateFiring {
 			firingAlertIDs = append(firingAlertIDs, state.AlertID)
@@ -211,6 +259,7 @@ func (e *Engine) applyActiveCondition(state *RuntimeState, rule config.RuleConfi
 		return domain.Decision{Matched: true, AlertID: state.AlertID}
 	}
 
+	state.HysteresisSince = nil
 	hasPending := rule.Pending.Enabled
 	switch state.CurrentState {
 	case "":
@@ -266,6 +315,19 @@ func (e *Engine) applyActiveCondition(state *RuntimeState, rule config.RuleConfi
 		_ = resolveCause
 		return domain.Decision{Matched: true, AlertID: state.AlertID}
 	}
+}
+
+// resetResolvedState clears runtime fields after alert resolve transition.
+// Params: mutable runtime state pointer.
+// Returns: state reset in place for next lifecycle.
+func resetResolvedState(state *RuntimeState) {
+	state.CurrentState = ""
+	state.PendingSince = nil
+	state.HysteresisSince = nil
+	state.CountWindow = nil
+	state.CountWindowSum = 0
+	state.CountTotal = 0
+	state.RaisedAt = time.Time{}
 }
 
 // ensureState gets or initializes runtime state for alert ID.

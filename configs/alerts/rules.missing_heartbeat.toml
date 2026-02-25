@@ -4,8 +4,8 @@
 # Кратко:
 # - Отслеживает отсутствие heartbeat-событий после первого принятого события.
 # - Поднятие (firing): если heartbeat не приходил raise.missing_sec секунд.
-# - Опускание (resolved): при первом новом heartbeat-событии,
-#   прошедшем match-фильтры.
+# - Опускание (resolved): после подтвержденного восстановления heartbeat
+#   (настройка resolve.hysteresis_sec).
 # ------------------------------------------------------------
 
 [rule.hb_telegram_live]
@@ -30,6 +30,12 @@ from_tags = ["dc", "service", "host"]
 # Взведение: если heartbeat не поступал missing_sec секунд -> firing.
 # Если heartbeat не приходил missing_sec секунд -> firing.
 missing_sec = 60
+
+[rule.hb_telegram_live.resolve]
+# Гистерезис восстановления heartbeat:
+# - 0  => мгновенный resolved на первом heartbeat (legacy-поведение).
+# - >0 => resolved только если heartbeat стабилен hysteresis_sec секунд.
+hysteresis_sec = 30
 
 [rule.hb_telegram_live.pending]
 # Включает стадию pending перед firing.

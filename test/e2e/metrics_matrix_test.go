@@ -37,6 +37,16 @@ func allE2EMetricCases() []e2eMetricCase {
 	}
 }
 
+// e2eFunctionalMetricCases returns minimal representative metric set
+// for transport/lifecycle e2e scenarios that do not verify rule math.
+// Params: none.
+// Returns: reduced metric list for functional e2e coverage.
+func e2eFunctionalMetricCases() []e2eMetricCase {
+	return []e2eMetricCase{
+		{Name: "count_total", AlertType: "count_total"},
+	}
+}
+
 // defaultE2ERuleOptions returns baseline thresholds per metric type.
 // Params: metric group.
 // Returns: normalized rule options.

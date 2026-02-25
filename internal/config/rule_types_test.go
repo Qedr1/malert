@@ -23,6 +23,7 @@ func TestValidateRuleMissingHeartbeatValid(t *testing.T) {
 	rule.AlertType = "missing_heartbeat"
 	rule.Raise.MissingSec = 5
 	rule.Resolve.SilenceSec = 0
+	rule.Resolve.HysteresisSec = 30
 	rule.Raise.N = 0
 	rule.Raise.TaggSec = 0
 
@@ -45,6 +46,20 @@ func TestValidateRuleCountWindowRejectsMissingSec(t *testing.T) {
 	}
 }
 
+func TestValidateRuleCountTotalAcceptsHysteresisSec(t *testing.T) {
+	t.Parallel()
+
+	rule := baseRuleForTypeTests()
+	rule.AlertType = "count_total"
+	rule.Raise.N = 1
+	rule.Resolve.SilenceSec = 5
+	rule.Resolve.HysteresisSec = 1
+
+	if err := validateRule(rule); err != nil {
+		t.Fatalf("expected valid count_total with resolve.hysteresis_sec, got: %v", err)
+	}
+}
+
 func TestValidateRuleMissingHeartbeatRejectsResolveAndRaiseN(t *testing.T) {
 	t.Parallel()
 
@@ -56,6 +71,48 @@ func TestValidateRuleMissingHeartbeatRejectsResolveAndRaiseN(t *testing.T) {
 
 	if err := validateRule(rule); err == nil {
 		t.Fatalf("expected error for missing_heartbeat with raise.n/resolve.silence_sec")
+	}
+}
+
+func TestValidateRuleMissingHeartbeatRejectsNegativeHysteresisSec(t *testing.T) {
+	t.Parallel()
+
+	rule := baseRuleForTypeTests()
+	rule.AlertType = "missing_heartbeat"
+	rule.Raise.MissingSec = 5
+	rule.Resolve.HysteresisSec = -1
+
+	if err := validateRule(rule); err == nil {
+		t.Fatalf("expected error for missing_heartbeat with negative resolve.hysteresis_sec")
+	}
+}
+
+func TestResolveTimeoutMissingHeartbeatIncludesHysteresisSec(t *testing.T) {
+	t.Parallel()
+
+	rule := baseRuleForTypeTests()
+	rule.AlertType = "missing_heartbeat"
+	rule.Raise.MissingSec = 5
+	rule.Resolve.HysteresisSec = 7
+
+	timeout := ResolveTimeout(rule)
+	if timeout.Seconds() != 12 {
+		t.Fatalf("expected timeout=12s, got %s", timeout)
+	}
+}
+
+func TestResolveTimeoutCountTotalIncludesHysteresisSec(t *testing.T) {
+	t.Parallel()
+
+	rule := baseRuleForTypeTests()
+	rule.AlertType = "count_total"
+	rule.Raise.N = 1
+	rule.Resolve.SilenceSec = 5
+	rule.Resolve.HysteresisSec = 7
+
+	timeout := ResolveTimeout(rule)
+	if timeout.Seconds() != 12 {
+		t.Fatalf("expected timeout=12s, got %s", timeout)
 	}
 }
 

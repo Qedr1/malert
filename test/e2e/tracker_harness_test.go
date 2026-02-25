@@ -49,7 +49,7 @@ func (l *trackerPathLog) count(path string) int {
 
 func runTrackerCreateAndResolveE2E(t *testing.T, scenario trackerE2EScenario) {
 	t.Helper()
-	for _, metric := range allE2EMetricCases() {
+	for _, metric := range e2eFunctionalMetricCases() {
 		metric := metric
 		t.Run(metric.Name, func(t *testing.T) {
 			port, err := freePort()

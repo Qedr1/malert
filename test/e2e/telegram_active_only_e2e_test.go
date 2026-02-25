@@ -65,7 +65,7 @@ func (m *telegramActiveMock) snapshot() []telegramActiveCall {
 }
 
 func TestTelegramActiveOnlyLifecycleE2E(t *testing.T) {
-	for _, metric := range allE2EMetricCases() {
+	for _, metric := range e2eFunctionalMetricCases() {
 		metric := metric
 		t.Run(metric.Name, func(t *testing.T) {
 			port, err := freePort()

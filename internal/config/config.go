@@ -498,10 +498,11 @@ type RuleRaise struct {
 }
 
 // RuleResolve defines resolve timeout settings.
-// Params: silence timeout for count-based rules.
+// Params: silence timeout and optional hysteresis confirmation window before resolved.
 // Returns: resolve behavior.
 type RuleResolve struct {
-	SilenceSec int `toml:"silence_sec"`
+	SilenceSec    int `toml:"silence_sec"`
+	HysteresisSec int `toml:"hysteresis_sec"`
 }
 
 // RulePending controls pending-to-firing confirmation.
@@ -595,9 +596,9 @@ func LoadSnapshot(src ConfigSource) (Config, error) {
 func ResolveTimeout(rule RuleConfig) time.Duration {
 	switch rule.AlertType {
 	case "count_total", "count_window":
-		return time.Duration(rule.Resolve.SilenceSec) * time.Second
+		return time.Duration(rule.Resolve.SilenceSec+rule.Resolve.HysteresisSec) * time.Second
 	case "missing_heartbeat":
-		return time.Duration(rule.Raise.MissingSec) * time.Second
+		return time.Duration(rule.Raise.MissingSec+rule.Resolve.HysteresisSec) * time.Second
 	default:
 		return 0
 	}
@@ -1461,6 +1462,9 @@ func validateRule(rule RuleConfig) error {
 		if rule.Resolve.SilenceSec < 0 {
 			return errors.New("resolve.silence_sec must be >=0")
 		}
+		if rule.Resolve.HysteresisSec < 0 {
+			return errors.New("resolve.hysteresis_sec must be >=0")
+		}
 		if rule.Raise.TaggSec > 0 || rule.Raise.MissingSec > 0 {
 			return errors.New("count_total forbids raise.tagg_sec and raise.missing_sec")
 		}
@@ -1474,6 +1478,9 @@ func validateRule(rule RuleConfig) error {
 		if rule.Resolve.SilenceSec < 0 {
 			return errors.New("resolve.silence_sec must be >=0")
 		}
+		if rule.Resolve.HysteresisSec < 0 {
+			return errors.New("resolve.hysteresis_sec must be >=0")
+		}
 		if rule.Raise.MissingSec > 0 {
 			return errors.New("count_window forbids raise.missing_sec")
 		}
@@ -1481,7 +1488,10 @@ func validateRule(rule RuleConfig) error {
 		if rule.Raise.MissingSec <= 0 {
 			return errors.New("raise.missing_sec must be >0")
 		}
-		if rule.Raise.N > 0 || rule.Raise.TaggSec > 0 || rule.Resolve.SilenceSec > 0 {
+		if rule.Resolve.HysteresisSec < 0 {
+			return errors.New("resolve.hysteresis_sec must be >=0")
+		}
+		if rule.Raise.N > 0 || rule.Raise.TaggSec > 0 || rule.Resolve.SilenceSec != 0 {
 			return errors.New("missing_heartbeat forbids raise.n, raise.tagg_sec, resolve.silence_sec")
 		}
 	}

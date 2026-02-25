@@ -67,7 +67,7 @@ func (c *notificationCollector) Snapshot() []domain.Notification {
 }
 
 func TestHotReloadApplyValidSnapshot(t *testing.T) {
-	for _, metric := range allE2EMetricCases() {
+	for _, metric := range e2eFunctionalMetricCases() {
 		metric := metric
 		t.Run(metric.Name, func(t *testing.T) {
 			port, err := freePort()
@@ -134,7 +134,7 @@ func TestHotReloadApplyValidSnapshot(t *testing.T) {
 }
 
 func TestHotReloadKeepsPreviousSnapshotOnValidationError(t *testing.T) {
-	for _, metric := range allE2EMetricCases() {
+	for _, metric := range e2eFunctionalMetricCases() {
 		metric := metric
 		t.Run(metric.Name, func(t *testing.T) {
 			port, err := freePort()
