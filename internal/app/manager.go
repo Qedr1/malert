@@ -674,6 +674,13 @@ func (m *Manager) dispatchNotification(ctx context.Context, rule config.RuleConf
 	if len(routeOverride) > 0 {
 		routes = routeOverride
 	}
+	notifyAt := notification.Timestamp
+	if notifyAt.IsZero() {
+		notifyAt = m.clock.Now()
+	}
+	if m.shouldSkipNotificationByOff(rule, notification, notifyAt) {
+		return nil
+	}
 	if producer := m.queueProducerSnapshot(); producer != nil {
 		return m.enqueueNotificationJobs(ctx, producer, notification, routes)
 	}
@@ -699,6 +706,11 @@ func (m *Manager) ProcessQueuedNotification(ctx context.Context, job notifyqueue
 	}
 
 	notification := job.Notification
+	if rule, ok := m.ruleByName(notification.RuleName); ok {
+		if m.shouldSkipNotificationByOff(rule, notification, m.clock.Now()) {
+			return nil
+		}
+	}
 	results, err := m.notifyRoutes(ctx, notification, []config.RuleNotifyRoute{{
 		Name:     normalizedRoute.Key,
 		Channel:  normalizedRoute.Channel,
@@ -840,6 +852,28 @@ func (m *Manager) prepareNotificationForRoute(notification domain.Notification, 
 		}
 	}
 	return perRoute, true
+}
+
+// shouldSkipNotificationByOff checks per-rule notify.off windows and logs skipped sends.
+// Params: rule definition, outbound notification payload, and evaluation time.
+// Returns: true when send must be skipped by off-window policy.
+func (m *Manager) shouldSkipNotificationByOff(rule config.RuleConfig, notification domain.Notification, now time.Time) bool {
+	offActive, err := config.NotifyOffActiveAt(rule.Notify.Off, now, time.Local)
+	if err != nil {
+		m.logger.Warn("notify.off evaluation failed", "rule", rule.Name, "alert_id", notification.AlertID, "error", err.Error())
+		return false
+	}
+	if !offActive {
+		return false
+	}
+	m.logger.Info(
+		"notification skipped by notify.off window",
+		"rule", rule.Name,
+		"alert_id", notification.AlertID,
+		"state", notification.State,
+		"at", now,
+	)
+	return true
 }
 
 // isPermanentNotifyError classifies delivery errors that should not be retried.

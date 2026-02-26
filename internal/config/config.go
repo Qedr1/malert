@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -133,6 +134,15 @@ var (
 	unsupportedIngestNATSFixedKeysPattern = regexp.MustCompile(`(?mi)^\s*(?:subject|stream|consumer_name|deliver_group)\s*=`)
 	unsupportedNotifyQueueURLPattern      = regexp.MustCompile(`(?si)\[\s*notify\.queue\s*\][^\[]*\burl\s*=`)
 	unsupportedNotifyQueueDLQTablePattern = regexp.MustCompile(`(?mi)^\s*\[\s*notify\.queue\.dlq\s*\]`)
+	notifyOffWeekdays                     = map[string]time.Weekday{
+		"sun": time.Sunday,
+		"mon": time.Monday,
+		"tue": time.Tuesday,
+		"wed": time.Wednesday,
+		"thu": time.Thursday,
+		"fri": time.Friday,
+		"sat": time.Saturday,
+	}
 )
 
 // notifyChannelDescriptor stores generic accessors for one notify transport.
@@ -521,6 +531,7 @@ type RuleNotify struct {
 	RepeatEverySec int               `toml:"repeat_every_sec"`
 	OnPending      *bool             `toml:"on_pending"`
 	Route          []RuleNotifyRoute `toml:"route"`
+	Off            []RuleNotifyOff   `toml:"off"`
 }
 
 // RuleNotifyRoute binds one transport channel with one named message template.
@@ -531,6 +542,15 @@ type RuleNotifyRoute struct {
 	Channel  string `toml:"channel"`
 	Template string `toml:"template"`
 	Mode     string `toml:"mode"`
+}
+
+// RuleNotifyOff defines one notification suppression window by day/time.
+// Params: weekday list and local time range.
+// Returns: one per-rule notify off window.
+type RuleNotifyOff struct {
+	Days []string `toml:"days"`
+	From string   `toml:"from"`
+	To   string   `toml:"to"`
 }
 
 // RuleOutOfOrder defines safeguards for delayed/future events.
@@ -1453,6 +1473,9 @@ func validateRule(rule RuleConfig) error {
 	if len(rule.Notify.Route) == 0 {
 		return errors.New("notify.route is required")
 	}
+	if err := validateNotifyOff(rule.Notify.Off); err != nil {
+		return err
+	}
 
 	switch rule.AlertType {
 	case "count_total":
@@ -1497,6 +1520,167 @@ func validateRule(rule RuleConfig) error {
 	}
 
 	return nil
+}
+
+// validateNotifyOff validates rule-level notification off windows.
+// Params: off windows from rule.notify section.
+// Returns: validation error with indexed window path.
+func validateNotifyOff(windows []RuleNotifyOff) error {
+	for index, window := range windows {
+		if err := validateNotifyOffWindow(window); err != nil {
+			return fmt.Errorf("notify.off[%d]: %w", index, err)
+		}
+	}
+	return nil
+}
+
+// NotifyOffActiveAt checks whether local time is inside any configured off window.
+// Params: off windows, current time, and target location (time.Local when nil).
+// Returns: true when notifications must be skipped.
+func NotifyOffActiveAt(windows []RuleNotifyOff, now time.Time, loc *time.Location) (bool, error) {
+	if len(windows) == 0 {
+		return false, nil
+	}
+	if loc == nil {
+		loc = time.Local
+	}
+	current := now.In(loc)
+	minuteOfDay := current.Hour()*60 + current.Minute()
+	weekday := current.Weekday()
+	prevWeekday := previousWeekday(weekday)
+
+	for index, window := range windows {
+		weekdays, err := parseNotifyOffDays(window.Days)
+		if err != nil {
+			return false, fmt.Errorf("notify.off[%d]: %w", index, err)
+		}
+		fromMinute, err := parseNotifyOffClock(window.From, false)
+		if err != nil {
+			return false, fmt.Errorf("notify.off[%d].from: %w", index, err)
+		}
+		toMinute, err := parseNotifyOffClock(window.To, true)
+		if err != nil {
+			return false, fmt.Errorf("notify.off[%d].to: %w", index, err)
+		}
+		if fromMinute == toMinute {
+			return false, fmt.Errorf("notify.off[%d]: from and to must define non-empty interval", index)
+		}
+
+		if notifyOffContainsMinute(weekdays, weekday, prevWeekday, minuteOfDay, fromMinute, toMinute) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// validateNotifyOffWindow validates one off-window definition.
+// Params: one rule notify off window.
+// Returns: validation error for malformed weekdays or time interval.
+func validateNotifyOffWindow(window RuleNotifyOff) error {
+	if _, err := parseNotifyOffDays(window.Days); err != nil {
+		return err
+	}
+	fromMinute, err := parseNotifyOffClock(window.From, false)
+	if err != nil {
+		return fmt.Errorf("from: %w", err)
+	}
+	toMinute, err := parseNotifyOffClock(window.To, true)
+	if err != nil {
+		return fmt.Errorf("to: %w", err)
+	}
+	if fromMinute == toMinute {
+		return errors.New("from and to must define non-empty interval")
+	}
+	return nil
+}
+
+// parseNotifyOffDays parses weekday tokens into a set.
+// Params: raw weekday token list (mon..sun).
+// Returns: set of weekdays or parse error.
+func parseNotifyOffDays(days []string) (map[time.Weekday]struct{}, error) {
+	if len(days) == 0 {
+		return nil, errors.New("days is required")
+	}
+	out := make(map[time.Weekday]struct{}, len(days))
+	for _, raw := range days {
+		token := strings.ToLower(strings.TrimSpace(raw))
+		weekday, ok := notifyOffWeekdays[token]
+		if !ok {
+			return nil, fmt.Errorf("unsupported day %q", raw)
+		}
+		out[weekday] = struct{}{}
+	}
+	return out, nil
+}
+
+// parseNotifyOffClock parses HH:MM time into minutes from day start.
+// Params: raw clock string and whether 24:00 is allowed.
+// Returns: minute index [0..1440] by policy.
+func parseNotifyOffClock(raw string, allow2400 bool) (int, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, errors.New("time is required")
+	}
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid time %q (expected HH:MM)", raw)
+	}
+	hour, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, fmt.Errorf("invalid hour in %q", raw)
+	}
+	minute, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, fmt.Errorf("invalid minute in %q", raw)
+	}
+	if minute < 0 || minute > 59 {
+		return 0, fmt.Errorf("minute out of range in %q", raw)
+	}
+	if allow2400 && hour == 24 && minute == 0 {
+		return 24 * 60, nil
+	}
+	if hour < 0 || hour > 23 {
+		return 0, fmt.Errorf("hour out of range in %q", raw)
+	}
+	return hour*60 + minute, nil
+}
+
+// notifyOffContainsMinute checks whether minute/day belongs to one off-window.
+// Params: weekday set, current weekday, previous weekday, minute, and interval boundaries.
+// Returns: true when minute falls into the configured interval.
+func notifyOffContainsMinute(
+	weekdays map[time.Weekday]struct{},
+	weekday time.Weekday,
+	prevWeekday time.Weekday,
+	minuteOfDay int,
+	fromMinute int,
+	toMinute int,
+) bool {
+	if fromMinute < toMinute {
+		if _, ok := weekdays[weekday]; !ok {
+			return false
+		}
+		return minuteOfDay >= fromMinute && minuteOfDay < toMinute
+	}
+	if minuteOfDay >= fromMinute {
+		_, ok := weekdays[weekday]
+		return ok
+	}
+	if minuteOfDay < toMinute {
+		_, ok := weekdays[prevWeekday]
+		return ok
+	}
+	return false
+}
+
+// previousWeekday returns the previous day value.
+// Params: current weekday.
+// Returns: previous weekday in [Sunday..Saturday].
+func previousWeekday(day time.Weekday) time.Weekday {
+	if day == time.Sunday {
+		return time.Saturday
+	}
+	return day - 1
 }
 
 // validateValuePredicate validates typed value predicate operators.

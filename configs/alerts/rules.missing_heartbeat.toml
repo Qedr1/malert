@@ -50,6 +50,13 @@ enabled = false
 # Сколько секунд условие должно удерживаться в pending до firing.
 delay_sec = 300
 
+# Окна без отправки уведомлений (локальная timezone хоста):
+# В это время алерт продолжает вычисляться и логироваться, но уведомления не отправляются.
+# [[rule.example_missing_heartbeat.notify.off]]
+# days = ["mon", "tue", "wed", "thu", "fri"]
+# from = "01:00"
+# to = "06:00"
+
 [[rule.example_missing_heartbeat.notify.route]]
 # Канал доставки для уведомлений этого правила.
 channel = "telegram"

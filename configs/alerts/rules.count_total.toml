@@ -54,6 +54,13 @@ enabled = false
 # Сколько секунд условие должно удерживаться в pending до firing.
 delay_sec = 300
 
+# Окна без отправки уведомлений (локальная timezone хоста):
+# В это время алерт продолжает вычисляться и логироваться, но уведомления не отправляются.
+# [[rule.example_count_total.notify.off]]
+# days = ["mon", "tue", "wed", "thu", "fri"]
+# from = "22:00"
+# to = "08:00"
+
 [[rule.example_count_total.notify.route]]
 # Канал доставки для уведомлений этого правила.
 channel = "telegram"
