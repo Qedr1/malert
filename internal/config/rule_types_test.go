@@ -8,7 +8,7 @@ func TestValidateRuleCountWindowValid(t *testing.T) {
 	rule := baseRuleForTypeTests()
 	rule.AlertType = "count_window"
 	rule.Raise.N = 3
-	rule.Raise.TaggSec = 10
+	rule.Raise.WindowSec = 10
 	rule.Resolve.SilenceSec = 30
 
 	if err := validateRule(rule); err != nil {
@@ -25,7 +25,7 @@ func TestValidateRuleMissingHeartbeatValid(t *testing.T) {
 	rule.Resolve.SilenceSec = 0
 	rule.Resolve.HysteresisSec = 30
 	rule.Raise.N = 0
-	rule.Raise.TaggSec = 0
+	rule.Raise.WindowSec = 0
 
 	if err := validateRule(rule); err != nil {
 		t.Fatalf("validateRule(missing_heartbeat) failed: %v", err)
@@ -38,7 +38,7 @@ func TestValidateRuleCountWindowRejectsMissingSec(t *testing.T) {
 	rule := baseRuleForTypeTests()
 	rule.AlertType = "count_window"
 	rule.Raise.N = 1
-	rule.Raise.TaggSec = 5
+	rule.Raise.WindowSec = 5
 	rule.Raise.MissingSec = 1
 
 	if err := validateRule(rule); err == nil {

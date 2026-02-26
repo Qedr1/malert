@@ -493,7 +493,7 @@ type RuleKey struct {
 // Returns: raise behavior.
 type RuleRaise struct {
 	N          int `toml:"n"`
-	TaggSec    int `toml:"tagg_sec"`
+	WindowSec  int `toml:"window_sec"`
 	MissingSec int `toml:"missing_sec"`
 }
 
@@ -1465,15 +1465,15 @@ func validateRule(rule RuleConfig) error {
 		if rule.Resolve.HysteresisSec < 0 {
 			return errors.New("resolve.hysteresis_sec must be >=0")
 		}
-		if rule.Raise.TaggSec > 0 || rule.Raise.MissingSec > 0 {
-			return errors.New("count_total forbids raise.tagg_sec and raise.missing_sec")
+		if rule.Raise.WindowSec > 0 || rule.Raise.MissingSec > 0 {
+			return errors.New("count_total forbids raise.window_sec and raise.missing_sec")
 		}
 	case "count_window":
 		if rule.Raise.N < 1 {
 			return errors.New("raise.n must be >=1")
 		}
-		if rule.Raise.TaggSec <= 0 {
-			return errors.New("raise.tagg_sec must be >0")
+		if rule.Raise.WindowSec <= 0 {
+			return errors.New("raise.window_sec must be >0")
 		}
 		if rule.Resolve.SilenceSec < 0 {
 			return errors.New("resolve.silence_sec must be >=0")
@@ -1491,8 +1491,8 @@ func validateRule(rule RuleConfig) error {
 		if rule.Resolve.HysteresisSec < 0 {
 			return errors.New("resolve.hysteresis_sec must be >=0")
 		}
-		if rule.Raise.N > 0 || rule.Raise.TaggSec > 0 || rule.Resolve.SilenceSec != 0 {
-			return errors.New("missing_heartbeat forbids raise.n, raise.tagg_sec, resolve.silence_sec")
+		if rule.Raise.N > 0 || rule.Raise.WindowSec > 0 || rule.Resolve.SilenceSec != 0 {
+			return errors.New("missing_heartbeat forbids raise.n, raise.window_sec, resolve.silence_sec")
 		}
 	}
 

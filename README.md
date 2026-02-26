@@ -135,6 +135,7 @@ pending опционален (pending.enabled, pending.delay_sec).
 10. Повторы firing управляются notify.repeat*.
 В queue-режиме доставка per-channel best-effort (ошибка одного канала не блокирует другие).
 
+
 ## Входящие события
 Структура
 ```
@@ -202,7 +203,7 @@ value.t="n|s|b"
    - value.t="s": == != in prefix match *
    - оператор * использует glob-маску (*, ?), сравнение без учета регистра
    - value.t="b": == !=
-     
+
 Примеры фильтрации в  configs/alerts/rules*
 
 События не прошедшие фильтр не влияют на алерт.
@@ -255,26 +256,26 @@ DOWN:
 - resolve.hysteresis_sec >= 0
 
 Запрещённые параметры (конфиг):
-- raise.tagg_sec
+- raise.window_sec
 - raise.missing_sec
 ```
 Пример: configs/alerts/rules.count_total.toml.
 
 ## Тип алерта "CountWindow"
 ```
-Количество событий(N) прошедших фильтр за период времени  tagg_sec ( time aggregation. скользящее окно)
+Количество событий(N) прошедших фильтр за период времени  window_sec ( time aggregation. скользящее окно)
 
 UP:
-- W[KEY] = sum(agg_cnt) по событиям за последние tagg_sec секунд
+- W[KEY] = sum(agg_cnt) по событиям за последние window_sec секунд
 - если W[KEY] >= N → FIRING(KEY) (или PENDING(KEY) -> FIRING(KEY), если включен pending)
 
 DOWN:
 - если now - last_seen[KEY] >= silence_sec + hysteresis_sec → RESOLVED(KEY)
-- обычно resolve.silence_sec = raise.tagg_sec, но допускается отдельное значение
+- обычно resolve.silence_sec = raise.window_sec, но допускается отдельное значение
 
 Обязательные параметры (конфиг):
 - raise.n >= 1
-- raise.tagg_sec > 0
+- raise.window_sec > 0
 - resolve.silence_sec >= 0
 - resolve.hysteresis_sec >= 0
 
@@ -304,7 +305,7 @@ DOWN:
 
 Запрещённые параметры (конфиг):
 - raise.n
-- raise.tagg_sec
+- raise.window_sec
 - resolve.silence_sec
 ```
 Пример: configs/alerts/rules.missing_heartbeat.toml.

@@ -263,7 +263,7 @@ func benchmarkRuleForMetric(metric e2eMetricCase, name string) config.RuleConfig
 		rule.Resolve.SilenceSec = 3600
 	case "count_window":
 		rule.Raise.N = 1_000_000_000
-		rule.Raise.TaggSec = 60
+		rule.Raise.WindowSec = 60
 		rule.Resolve.SilenceSec = 3600
 	default:
 		rule.Raise.MissingSec = 3600

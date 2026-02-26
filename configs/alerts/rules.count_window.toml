@@ -2,19 +2,19 @@
 # ALERTING: ПРАВИЛА ТИПА count_window
 # Формат правил: [rule.<rule_name>] + вложенные секции
 # Кратко:
-# - Считает события в скользящем окне raise.tagg_sec секунд.
+# - Считает события в скользящем окне raise.window_sec секунд.
 # - Поднятие (firing): когда сумма agg_cnt в окне >= raise.n.
 # - Опускание (resolved): когда после последнего события тишина
 #   длится не менее resolve.silence_sec секунд.
 # ------------------------------------------------------------
 
-[rule.cw_telegram_live]
+[rule.example_count_window]
 # Тип правила:
 # - count_window: считает события в скользящем окне времени.
 # Тип алгоритма: count_window (скользящее окно).
 alert_type = "count_window"
 
-[rule.cw_telegram_live.match]
+[rule.example_count_window.match]
 # Какие типы входящих событий учитывает правило.
 type = ["event", "agg"]
 # Список var, попадающих под это правило.
@@ -22,31 +22,38 @@ var = ["errors_window"]
 # Allow-only фильтр тегов.
 tags = { dc = ["dc1"], service = ["api"] }
 
-[rule.cw_telegram_live.key]
+[rule.example_count_window.match.value]
+# Дополнительный фильтр по значению переменной.
+# Для числового значения принимаем только value.n >= 1.
+t = "n"
+op = ">="
+n = 1
+
+[rule.example_count_window.key]
 # Список тегов, участвующих в построении детерминированного alert_id.
 from_tags = ["dc", "service", "host"]
 
-[rule.cw_telegram_live.raise]
+[rule.example_count_window.raise]
 # Порог взведения: firing если сумма agg_cnt в окне >= n.
-# За последние tagg_sec секунд нужно >= n событий.
+# За последние window_sec секунд нужно >= n событий.
 n = 10
 # Размер скользящего окна для подсчета (сек).
-tagg_sec = 60
+window_sec = 60
 
-[rule.cw_telegram_live.resolve]
+[rule.example_count_window.resolve]
 # Порог гашения: если после последнего события тишина silence_sec секунд -> resolved.
 # Гашение по тишине входящих событий.
 silence_sec = 120
 # Дополнительный гистерезис перед resolved (сек).
 hysteresis_sec = 0
 
-[rule.cw_telegram_live.pending]
+[rule.example_count_window.pending]
 # Включает стадию pending перед firing.
 enabled = false
 # Сколько секунд условие должно удерживаться в pending до firing.
 delay_sec = 300
 
-[[rule.cw_telegram_live.notify.route]]
+[[rule.example_count_window.notify.route]]
 # Канал доставки для уведомлений этого правила.
 channel = "telegram"
 # Имя шаблона в transport-конфиге канала.

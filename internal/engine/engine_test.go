@@ -251,8 +251,8 @@ func TestEngineCountWindowFireAndResolveBySilence(t *testing.T) {
 		},
 		Pending: config.RulePending{Enabled: false},
 		Raise: config.RuleRaise{
-			N:       3,
-			TaggSec: 5,
+			N:         3,
+			WindowSec: 5,
 		},
 		Resolve: config.RuleResolve{SilenceSec: 4},
 	}
@@ -303,8 +303,8 @@ func TestEngineCountWindowResolveHysteresis(t *testing.T) {
 		},
 		Pending: config.RulePending{Enabled: false},
 		Raise: config.RuleRaise{
-			N:       3,
-			TaggSec: 5,
+			N:         3,
+			WindowSec: 5,
 		},
 		Resolve: config.RuleResolve{SilenceSec: 4, HysteresisSec: 3},
 	}

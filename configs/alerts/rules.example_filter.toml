@@ -1,0 +1,485 @@
+# ------------------------------------------------------------
+# ALERTING: EXAMPLES OF MATCH FILTERS
+# Формат правил: [rule.<rule_name>] + вложенные секции
+#
+# Что демонстрирует этот файл:
+# - фильтр по тегам (match.tags)
+# - фильтр по имени переменной (match.var)
+# - фильтр по значению переменной (match.value)
+#   для всех типов t=n|s|b и всех поддерживаемых операций.
+# ------------------------------------------------------------
+
+[rule.example_filter_tags_var]
+alert_type = "count_total"
+
+[rule.example_filter_tags_var.match]
+type = ["event"]
+var = ["example_tags_var"]
+tags = { dc = ["dc1", "dc2"], service = ["api", "gateway"] }
+
+[rule.example_filter_tags_var.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_tags_var.raise]
+n = 1
+
+[rule.example_filter_tags_var.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_tags_var.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_tags_var.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+# ---------------------------
+# Numeric filters (t = "n")
+# Ops: == != > >= < <=
+# ---------------------------
+
+[rule.example_filter_n_eq]
+alert_type = "count_total"
+
+[rule.example_filter_n_eq.match]
+type = ["event"]
+var = ["example_n_eq"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_n_eq.match.value]
+t = "n"
+op = "=="
+n = 10
+
+[rule.example_filter_n_eq.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_n_eq.raise]
+n = 1
+
+[rule.example_filter_n_eq.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_n_eq.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_n_eq.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+[rule.example_filter_n_ne]
+alert_type = "count_total"
+
+[rule.example_filter_n_ne.match]
+type = ["event"]
+var = ["example_n_ne"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_n_ne.match.value]
+t = "n"
+op = "!="
+n = 10
+
+[rule.example_filter_n_ne.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_n_ne.raise]
+n = 1
+
+[rule.example_filter_n_ne.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_n_ne.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_n_ne.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+[rule.example_filter_n_gt]
+alert_type = "count_total"
+
+[rule.example_filter_n_gt.match]
+type = ["event"]
+var = ["example_n_gt"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_n_gt.match.value]
+t = "n"
+op = ">"
+n = 10
+
+[rule.example_filter_n_gt.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_n_gt.raise]
+n = 1
+
+[rule.example_filter_n_gt.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_n_gt.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_n_gt.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+[rule.example_filter_n_ge]
+alert_type = "count_total"
+
+[rule.example_filter_n_ge.match]
+type = ["event"]
+var = ["example_n_ge"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_n_ge.match.value]
+t = "n"
+op = ">="
+n = 10
+
+[rule.example_filter_n_ge.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_n_ge.raise]
+n = 1
+
+[rule.example_filter_n_ge.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_n_ge.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_n_ge.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+[rule.example_filter_n_lt]
+alert_type = "count_total"
+
+[rule.example_filter_n_lt.match]
+type = ["event"]
+var = ["example_n_lt"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_n_lt.match.value]
+t = "n"
+op = "<"
+n = 10
+
+[rule.example_filter_n_lt.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_n_lt.raise]
+n = 1
+
+[rule.example_filter_n_lt.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_n_lt.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_n_lt.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+[rule.example_filter_n_le]
+alert_type = "count_total"
+
+[rule.example_filter_n_le.match]
+type = ["event"]
+var = ["example_n_le"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_n_le.match.value]
+t = "n"
+op = "<="
+n = 10
+
+[rule.example_filter_n_le.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_n_le.raise]
+n = 1
+
+[rule.example_filter_n_le.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_n_le.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_n_le.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+# --------------------------
+# String filters (t = "s")
+# Ops: == != in prefix match *
+# --------------------------
+
+[rule.example_filter_s_eq]
+alert_type = "count_total"
+
+[rule.example_filter_s_eq.match]
+type = ["event"]
+var = ["example_s_eq"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_s_eq.match.value]
+t = "s"
+op = "=="
+s = "error"
+
+[rule.example_filter_s_eq.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_s_eq.raise]
+n = 1
+
+[rule.example_filter_s_eq.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_s_eq.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_s_eq.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+[rule.example_filter_s_ne]
+alert_type = "count_total"
+
+[rule.example_filter_s_ne.match]
+type = ["event"]
+var = ["example_s_ne"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_s_ne.match.value]
+t = "s"
+op = "!="
+s = "error"
+
+[rule.example_filter_s_ne.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_s_ne.raise]
+n = 1
+
+[rule.example_filter_s_ne.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_s_ne.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_s_ne.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+[rule.example_filter_s_in]
+alert_type = "count_total"
+
+[rule.example_filter_s_in.match]
+type = ["event"]
+var = ["example_s_in"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_s_in.match.value]
+t = "s"
+op = "in"
+in = ["error", "warn", "critical"]
+
+[rule.example_filter_s_in.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_s_in.raise]
+n = 1
+
+[rule.example_filter_s_in.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_s_in.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_s_in.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+[rule.example_filter_s_prefix]
+alert_type = "count_total"
+
+[rule.example_filter_s_prefix.match]
+type = ["event"]
+var = ["example_s_prefix"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_s_prefix.match.value]
+t = "s"
+op = "prefix"
+s = "api-"
+
+[rule.example_filter_s_prefix.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_s_prefix.raise]
+n = 1
+
+[rule.example_filter_s_prefix.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_s_prefix.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_s_prefix.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+[rule.example_filter_s_match]
+alert_type = "count_total"
+
+[rule.example_filter_s_match.match]
+type = ["event"]
+var = ["example_s_match"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_s_match.match.value]
+t = "s"
+op = "match"
+s = "(?i)^api-[0-9]+$"
+
+[rule.example_filter_s_match.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_s_match.raise]
+n = 1
+
+[rule.example_filter_s_match.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_s_match.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_s_match.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+[rule.example_filter_s_wildcard]
+alert_type = "count_total"
+
+[rule.example_filter_s_wildcard.match]
+type = ["event"]
+var = ["example_s_wildcard"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_s_wildcard.match.value]
+t = "s"
+op = "*"
+s = "api-*"
+
+[rule.example_filter_s_wildcard.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_s_wildcard.raise]
+n = 1
+
+[rule.example_filter_s_wildcard.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_s_wildcard.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_s_wildcard.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+# ------------------------
+# Bool filters (t = "b")
+# Ops: == !=
+# ------------------------
+
+[rule.example_filter_b_eq]
+alert_type = "count_total"
+
+[rule.example_filter_b_eq.match]
+type = ["event"]
+var = ["example_b_eq"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_b_eq.match.value]
+t = "b"
+op = "=="
+b = true
+
+[rule.example_filter_b_eq.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_b_eq.raise]
+n = 1
+
+[rule.example_filter_b_eq.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_b_eq.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_b_eq.notify.route]]
+channel = "telegram"
+template = "tg_default"
+
+[rule.example_filter_b_ne]
+alert_type = "count_total"
+
+[rule.example_filter_b_ne.match]
+type = ["event"]
+var = ["example_b_ne"]
+tags = { dc = ["dc1"], service = ["api"] }
+
+[rule.example_filter_b_ne.match.value]
+t = "b"
+op = "!="
+b = true
+
+[rule.example_filter_b_ne.key]
+from_tags = ["dc", "service", "host"]
+
+[rule.example_filter_b_ne.raise]
+n = 1
+
+[rule.example_filter_b_ne.resolve]
+silence_sec = 60
+hysteresis_sec = 0
+
+[rule.example_filter_b_ne.pending]
+enabled = false
+delay_sec = 300
+
+[[rule.example_filter_b_ne.notify.route]]
+channel = "telegram"
+template = "tg_default"

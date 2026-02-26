@@ -123,7 +123,7 @@ silence_sec = %[3]d
 		builder.WriteString(fmt.Sprintf(`
 [rule.%[1]s.raise]
 n = %[2]d
-tagg_sec = %[3]d
+window_sec = %[3]d
 
 [rule.%[1]s.resolve]
 silence_sec = %[4]d

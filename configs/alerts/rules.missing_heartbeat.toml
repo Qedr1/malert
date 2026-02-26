@@ -8,13 +8,13 @@
 #   (настройка resolve.hysteresis_sec).
 # ------------------------------------------------------------
 
-[rule.hb_telegram_live]
+[rule.example_missing_heartbeat]
 # Тип правила:
 # - missing_heartbeat: взводит алерт при отсутствии heartbeat после первого события.
 # Тип алгоритма: missing_heartbeat.
 alert_type = "missing_heartbeat"
 
-[rule.hb_telegram_live.match]
+[rule.example_missing_heartbeat.match]
 # Какие типы входящих событий считаем heartbeat-сигналом.
 type = ["event", "agg"]
 # Список var, которые считаются heartbeat для этого правила.
@@ -22,28 +22,35 @@ var = ["heartbeat"]
 # Allow-only фильтр тегов.
 tags = { dc = ["dc1"], service = ["api"] }
 
-[rule.hb_telegram_live.key]
+[rule.example_missing_heartbeat.match.value]
+# Дополнительный фильтр по значению heartbeat.
+# Обрабатываем только числовые heartbeat-события с value.n >= 1.
+t = "n"
+op = ">="
+n = 1
+
+[rule.example_missing_heartbeat.key]
 # Список тегов, участвующих в построении детерминированного alert_id.
 from_tags = ["dc", "service", "host"]
 
-[rule.hb_telegram_live.raise]
+[rule.example_missing_heartbeat.raise]
 # Взведение: если heartbeat не поступал missing_sec секунд -> firing.
 # Если heartbeat не приходил missing_sec секунд -> firing.
 missing_sec = 60
 
-[rule.hb_telegram_live.resolve]
+[rule.example_missing_heartbeat.resolve]
 # Гистерезис восстановления heartbeat:
 # - 0  => мгновенный resolved на первом heartbeat (legacy-поведение).
 # - >0 => resolved только если heartbeat стабилен hysteresis_sec секунд.
 hysteresis_sec = 30
 
-[rule.hb_telegram_live.pending]
+[rule.example_missing_heartbeat.pending]
 # Включает стадию pending перед firing.
 enabled = false
 # Сколько секунд условие должно удерживаться в pending до firing.
 delay_sec = 300
 
-[[rule.hb_telegram_live.notify.route]]
+[[rule.example_missing_heartbeat.notify.route]]
 # Канал доставки для уведомлений этого правила.
 channel = "telegram"
 # Имя шаблона в transport-конфиге канала.

@@ -98,7 +98,7 @@ func (e *Engine) ProcessEvent(rule config.RuleConfig, event domain.Event, alertI
 		state.Initialized = true
 		state.CountWindow = append(state.CountWindow, WindowPoint{At: now, Count: event.AggCnt})
 		state.CountWindowSum += event.AggCnt
-		state.CountWindow, state.CountWindowSum = pruneWindow(state.CountWindow, now, time.Duration(rule.Raise.TaggSec)*time.Second, state.CountWindowSum)
+		state.CountWindow, state.CountWindowSum = pruneWindow(state.CountWindow, now, time.Duration(rule.Raise.WindowSec)*time.Second, state.CountWindowSum)
 		return e.applyActiveCondition(state, rule, now, state.CountWindowSum >= int64(rule.Raise.N), false, "")
 	case "missing_heartbeat":
 		if !state.Initialized {
