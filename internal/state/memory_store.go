@@ -102,15 +102,25 @@ func (s *MemoryStore) GetCard(_ context.Context, alertID string) (domain.AlertCa
 	return entry.card, entry.revision, nil
 }
 
+// CreateCard writes card payload only when key does not exist yet.
+// Params: alert ID key and card payload.
+// Returns: new revision or ErrConflict when key already exists.
+func (s *MemoryStore) CreateCard(_ context.Context, alertID string, card domain.AlertCard) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.cards[alertID]; exists {
+		return 0, ErrConflict
+	}
+	return s.writeCardLocked(alertID, card, 1), nil
+}
+
 // PutCard writes card payload unconditionally.
 // Params: alert ID key and card payload.
 // Returns: new revision.
 func (s *MemoryStore) PutCard(_ context.Context, alertID string, card domain.AlertCard) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rev := s.cards[alertID].revision + 1
-	s.cards[alertID] = memoryCard{card: card, revision: rev}
-	return rev, nil
+	return s.writeCardLocked(alertID, card, s.cards[alertID].revision+1), nil
 }
 
 // UpdateCard updates card payload using expected revision CAS.
@@ -126,9 +136,7 @@ func (s *MemoryStore) UpdateCard(_ context.Context, alertID string, expectedRevi
 	if entry.revision != expectedRevision {
 		return 0, ErrConflict
 	}
-	rev := expectedRevision + 1
-	s.cards[alertID] = memoryCard{card: card, revision: rev}
-	return rev, nil
+	return s.writeCardLocked(alertID, card, expectedRevision+1), nil
 }
 
 // DeleteCard deletes card and corresponding tick key.
@@ -146,7 +154,7 @@ func (s *MemoryStore) DeleteCard(_ context.Context, alertID string) error {
 // Params: rule name namespace.
 // Returns: matching alert IDs.
 func (s *MemoryStore) ListAlertIDsByRule(_ context.Context, ruleName string) ([]string, error) {
-	prefix := "rule/" + strings.ToLower(strings.TrimSpace(ruleName)) + "/"
+	prefix := RuleAlertPrefix(ruleName)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	ids := make([]string, 0)
@@ -163,4 +171,12 @@ func (s *MemoryStore) ListAlertIDsByRule(_ context.Context, ruleName string) ([]
 // Returns: nil.
 func (s *MemoryStore) Close() error {
 	return nil
+}
+
+// writeCardLocked stores one card entry with caller-held mutex.
+// Params: alert id, card payload, and target revision.
+// Returns: stored revision.
+func (s *MemoryStore) writeCardLocked(alertID string, card domain.AlertCard, revision uint64) uint64 {
+	s.cards[alertID] = memoryCard{card: card, revision: revision}
+	return revision
 }

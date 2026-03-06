@@ -34,6 +34,8 @@
 - [Конфиг (TOML)](#конфиг-toml)
   - [Структура конфигов](#структура-конфигов)
   - [Глобальный конфиг сервиса](#глобальный-конфиг-сервиса)
+    - [Встроенная веб-морда](#встроенная-веб-морда)
+    - [Конфиг встроенной морды](#конфиг-встроенной-морды)
     - [Multi-instance](#multi-instance-1)
     - [Single-instance](#single-instance-1)
     - [Конфиги уведомлений](#конфиги-уведомлений)
@@ -453,6 +455,7 @@ template = "tg_default"
 - configs/alerts/base.toml — глобальный конфиг сервиса:
   - [service] — process/runtime настройки (name, reload_*, resolve_scan_interval_sec, runtime state limits).
   - [ingest.http] — HTTP server/ingest (listen, health_path, ready_path, ingest_path, max_body_bytes, enabled).
+  - [ui], [ui.auth.basic], [ui.nats], [ui.health], [ui.service] — встроенная веб-морда, ее аутентификация, discovery и health-probe настройки.
   - [log.*], [ingest.nats], [notify] — остальные подсистемы.
 - configs/alerts/rules.count_total.toml — правила типа count_total ([rule.<rule_name>], [rule.<rule_name>.*]).
 - configs/alerts/rules.count_window.toml — правила типа count_window.
@@ -466,6 +469,77 @@ template = "tg_default"
 
 
 ## Глобальный конфиг сервиса
+### Встроенная веб-морда
+В сервис встроена отдельная операционная веб-морда для наблюдения за состоянием алертинга.
+
+Что умеет сейчас:
+- показывает список сервисов алертинга и их статус (`online`, `degraded`, `offline`);
+- показывает активные алерты и их текущее состояние;
+- обновляет таблицы автоматически без ручного refresh страницы;
+- защищается basic auth из TOML-конфига;
+- не требует внешних js/css/assets файлов: UI собирается в тот же Go-бинарь.
+
+Что именно видно в интерфейсе:
+- `Services` — активные инстансы алертинга, режим работы, build version, host/ip и время последнего heartbeat/probe;
+- `Alerts` — active alert rows, тип алерта, состояние, сокращенный `alert_id`, переменная, последнее значение, threshold и счетчик событий.
+
+Ограничения текущей версии:
+- морда read-only;
+- редактирование конфигов и правил из браузера не поддерживается;
+- UI обновляется через опрос backend snapshot endpoint, а не через отдельный realtime transport;
+- UI не показывает секреты transport-конфигов, токены и пароли.
+
+### Конфиг встроенной морды
+Встроенная морда настраивается в `configs/alerts/base.toml`.
+
+Используются секции:
+- `[ui]` — включение UI, bind-адрес, base path и частота обновления;
+- `[ui.auth.basic]` — логин/пароль для доступа;
+- `[ui.nats]` — NATS discovery registry для списка сервисов;
+- `[ui.health]` — timeout probe-запросов к `healthz/readyz`;
+- `[ui.service]` — внешний `public_base_url`, который сервис публикует в registry как probe target.
+
+Логика работы:
+- сервис регистрирует себя в NATS registry;
+- морда читает registry и получает список инстансов;
+- фактический статус инстанса определяется не по registry, а по HTTP probe в `readyz` / `healthz`;
+- активные алерты читаются из state backend.
+
+Пример:
+```toml
+[ui]
+enabled = true
+listen = "0.0.0.0:19200"
+base_path = "/ui"
+refresh_sec = 2
+
+[ui.auth.basic]
+enabled = true
+username = "ops"
+password = "secret"
+
+[ui.nats]
+url = ["nats://127.0.0.1:4222"]
+registry_bucket = "ui_registry"
+registry_ttl_sec = 30
+stale_after_sec = 10
+offline_after_sec = 20
+
+[ui.health]
+timeout_sec = 2
+
+[ui.service]
+public_base_url = "http://alerting-1.example.net:8080"
+```
+
+Замечания по настройке:
+- `ui.listen` — где слушает сама морда;
+- `ui.base_path` — base path UI routes, обычно `/ui`;
+- `ui.service.public_base_url` должен быть доступен другим инстансам и самой морде; это не bind-адрес, а внешний URL сервиса;
+- `ui.nats.url` и `ui.nats.registry_bucket` обязательны при включенной морде;
+- `ui.auth.basic.enabled` должен быть `true`, иначе UI не стартует;
+- `ui.nats.stale_after_sec` должен быть меньше `ui.nats.offline_after_sec`, а `offline_after_sec` меньше `registry_ttl_sec`.
+
 ### Multi-instance
 ```toml
 # base.toml

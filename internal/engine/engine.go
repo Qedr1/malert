@@ -28,6 +28,7 @@ type RuntimeState struct {
 	CountTotal      int64
 	CountWindow     []WindowPoint
 	CountWindowSum  int64
+	ActiveCount     int64
 	LastNotified    map[string]time.Time
 	ChannelRefs     map[string]int
 	ExternalRefs    map[string]string
@@ -46,13 +47,12 @@ type AlertIdentity struct {
 // Params: immutable alert identity and repeat timing markers.
 // Returns: lightweight snapshot for repeat scheduling.
 type RepeatSnapshot struct {
-	AlertID      string
-	RuleName     string
-	Var          string
-	Tags         map[string]string
-	MetricValue  string
-	RaisedAt     time.Time
-	LastNotified map[string]time.Time
+	AlertID     string
+	RuleName    string
+	Var         string
+	Tags        map[string]string
+	MetricValue string
+	RaisedAt    time.Time
 }
 
 // WindowPoint stores one count contribution in sliding window.
@@ -93,11 +93,13 @@ func (e *Engine) ProcessEvent(rule config.RuleConfig, event domain.Event, alertI
 	case "count_total":
 		state.Initialized = true
 		state.CountTotal += event.AggCnt
+		state.ActiveCount += event.AggCnt
 		return e.applyActiveCondition(state, rule, now, state.CountTotal >= int64(rule.Raise.N), false, "")
 	case "count_window":
 		state.Initialized = true
 		state.CountWindow = append(state.CountWindow, WindowPoint{At: now, Count: event.AggCnt})
 		state.CountWindowSum += event.AggCnt
+		state.ActiveCount += event.AggCnt
 		state.CountWindow, state.CountWindowSum = pruneWindow(state.CountWindow, now, time.Duration(rule.Raise.WindowSec)*time.Second, state.CountWindowSum)
 		return e.applyActiveCondition(state, rule, now, state.CountWindowSum >= int64(rule.Raise.N), false, "")
 	case "missing_heartbeat":
@@ -327,6 +329,7 @@ func resetResolvedState(state *RuntimeState) {
 	state.CountWindow = nil
 	state.CountWindowSum = 0
 	state.CountTotal = 0
+	state.ActiveCount = 0
 	state.RaisedAt = time.Time{}
 }
 
@@ -385,7 +388,7 @@ func (e *Engine) GetAlertIdentity(alertID string) (AlertIdentity, bool) {
 	}
 	return AlertIdentity{
 		Var:         state.Var,
-		Tags:        cloneTags(state.Tags),
+		Tags:        state.Tags,
 		MetricValue: state.MetricValue,
 	}, true
 }
@@ -401,14 +404,27 @@ func (e *Engine) GetRepeatSnapshot(alertID string) (RepeatSnapshot, bool) {
 		return RepeatSnapshot{}, false
 	}
 	return RepeatSnapshot{
-		AlertID:      state.AlertID,
-		RuleName:     state.RuleName,
-		Var:          state.Var,
-		Tags:         cloneTags(state.Tags),
-		MetricValue:  state.MetricValue,
-		RaisedAt:     state.RaisedAt,
-		LastNotified: cloneTimes(state.LastNotified),
+		AlertID:     state.AlertID,
+		RuleName:    state.RuleName,
+		Var:         state.Var,
+		Tags:        state.Tags,
+		MetricValue: state.MetricValue,
+		RaisedAt:    state.RaisedAt,
 	}, true
+}
+
+// GetLastNotified returns one per-key notification timestamp for repeat scheduling.
+// Params: alert ID and repeat tracking key.
+// Returns: stored timestamp and existence flag.
+func (e *Engine) GetLastNotified(alertID, key string) (time.Time, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	state, ok := e.states[alertID]
+	if !ok || state.LastNotified == nil {
+		return time.Time{}, false
+	}
+	value, exists := state.LastNotified[key]
+	return value, exists
 }
 
 // metricValue formats typed event value for notification/template rendering.

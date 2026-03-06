@@ -15,6 +15,8 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+var tickPresencePayload = []byte{'1'}
+
 // NATSStore persists alert state in JetStream KV buckets.
 // Params: NATS connection, JetStream context, and KV bucket handles.
 // Returns: KV-backed state store implementation.
@@ -110,11 +112,10 @@ func enableBucketPerMessageTTL(js nats.JetStreamContext, bucket string) error {
 // RefreshTick creates or updates tick entry for alert.
 // Params: alert ID key, last-seen timestamp, and resolve TTL.
 // Returns: publish error.
-func (s *NATSStore) RefreshTick(_ context.Context, alertID string, lastSeen time.Time, ttl time.Duration) error {
+func (s *NATSStore) RefreshTick(_ context.Context, alertID string, _ time.Time, ttl time.Duration) error {
 	ttlMS := ttl.Milliseconds()
-	payload := buildTickPayload(lastSeen.UnixMilli(), ttlMS)
 	msg := nats.NewMsg(s.tickSubjectPrefix + alertID)
-	msg.Data = payload
+	msg.Data = tickPresencePayload
 	if ttl > 0 {
 		msg.Header = nats.Header{
 			"Nats-TTL": []string{strconv.FormatInt(ttlMS, 10) + "ms"},
@@ -124,19 +125,6 @@ func (s *NATSStore) RefreshTick(_ context.Context, alertID string, lastSeen time
 		return fmt.Errorf("publish tick: %w", err)
 	}
 	return nil
-}
-
-// buildTickPayload encodes lightweight tick metadata without reflective map encoding.
-// Params: event last-seen unix ms and ttl ms.
-// Returns: compact JSON payload for KV value.
-func buildTickPayload(lastSeenUnixMS, ttlMS int64) []byte {
-	payload := make([]byte, 0, 64)
-	payload = append(payload, `{"last_seen_unix_ms":`...)
-	payload = strconv.AppendInt(payload, lastSeenUnixMS, 10)
-	payload = append(payload, `,"ttl_ms":`...)
-	payload = strconv.AppendInt(payload, ttlMS, 10)
-	payload = append(payload, '}')
-	return payload
 }
 
 // HasTick checks whether tick key currently exists.
@@ -171,37 +159,31 @@ func (s *NATSStore) GetCard(_ context.Context, alertID string) (domain.AlertCard
 	return card, entry.Revision(), nil
 }
 
+// CreateCard writes card payload only when key does not exist yet.
+// Params: alert ID key and card payload.
+// Returns: new KV revision or ErrConflict.
+func (s *NATSStore) CreateCard(_ context.Context, alertID string, card domain.AlertCard) (uint64, error) {
+	return s.writeCard(alertID, card, "create", func(body []byte) (uint64, error) {
+		return s.dataKV.Create(alertID, body)
+	})
+}
+
 // PutCard writes card payload unconditionally.
 // Params: alert ID key and card payload.
 // Returns: new KV revision.
 func (s *NATSStore) PutCard(_ context.Context, alertID string, card domain.AlertCard) (uint64, error) {
-	body, err := json.Marshal(card)
-	if err != nil {
-		return 0, fmt.Errorf("encode card: %w", err)
-	}
-	rev, err := s.dataKV.Put(alertID, body)
-	if err != nil {
-		return 0, fmt.Errorf("put card: %w", err)
-	}
-	return rev, nil
+	return s.writeCard(alertID, card, "put", func(body []byte) (uint64, error) {
+		return s.dataKV.Put(alertID, body)
+	})
 }
 
 // UpdateCard updates card payload using expected revision CAS.
 // Params: alert ID key, expected revision, and replacement payload.
 // Returns: new KV revision or ErrConflict.
 func (s *NATSStore) UpdateCard(_ context.Context, alertID string, expectedRevision uint64, card domain.AlertCard) (uint64, error) {
-	body, err := json.Marshal(card)
-	if err != nil {
-		return 0, fmt.Errorf("encode card: %w", err)
-	}
-	rev, err := s.dataKV.Update(alertID, body, expectedRevision)
-	if err != nil {
-		if errors.Is(err, nats.ErrKeyExists) || strings.Contains(strings.ToLower(err.Error()), "wrong last sequence") {
-			return 0, ErrConflict
-		}
-		return 0, fmt.Errorf("update card: %w", err)
-	}
-	return rev, nil
+	return s.writeCard(alertID, card, "update", func(body []byte) (uint64, error) {
+		return s.dataKV.Update(alertID, body, expectedRevision)
+	})
 }
 
 // DeleteCard deletes card and corresponding tick key.
@@ -228,7 +210,7 @@ func (s *NATSStore) ListAlertIDsByRule(_ context.Context, ruleName string) ([]st
 		}
 		return nil, fmt.Errorf("list keys: %w", err)
 	}
-	prefix := "rule/" + strings.ToLower(strings.TrimSpace(ruleName)) + "/"
+	prefix := RuleAlertPrefix(ruleName)
 	ids := make([]string, 0)
 	for _, key := range keys {
 		if strings.HasPrefix(key, prefix) {
@@ -244,4 +226,29 @@ func (s *NATSStore) ListAlertIDsByRule(_ context.Context, ruleName string) ([]st
 func (s *NATSStore) Close() error {
 	s.nc.Close()
 	return nil
+}
+
+// writeCard marshals card payload and delegates one KV write operation.
+// Params: alert id, card payload, operation label, and KV write callback.
+// Returns: KV revision or normalized conflict/wrapped error.
+func (s *NATSStore) writeCard(alertID string, card domain.AlertCard, op string, write func([]byte) (uint64, error)) (uint64, error) {
+	body, err := json.Marshal(card)
+	if err != nil {
+		return 0, fmt.Errorf("encode card: %w", err)
+	}
+	rev, err := write(body)
+	if err == nil {
+		return rev, nil
+	}
+	if isNATSCardConflict(err) {
+		return 0, ErrConflict
+	}
+	return 0, fmt.Errorf("%s card: %w", op, err)
+}
+
+// isNATSCardConflict classifies JetStream KV optimistic-write conflicts.
+// Params: raw KV write error.
+// Returns: true when caller should map error to ErrConflict.
+func isNATSCardConflict(err error) bool {
+	return errors.Is(err, nats.ErrKeyExists) || strings.Contains(strings.ToLower(err.Error()), "wrong last sequence")
 }

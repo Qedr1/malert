@@ -41,6 +41,13 @@ func TestNATSStoreCRUDIntegration(t *testing.T) {
 		t.Fatalf("expected tick to exist")
 	}
 
+	if _, err := store.CreateCard(ctx, "rule/r/create/hash", domain.AlertCard{AlertID: "rule/r/create/hash", RuleName: "r", State: domain.AlertStateFiring}); err != nil {
+		t.Fatalf("create card: %v", err)
+	}
+	if _, err := store.CreateCard(ctx, "rule/r/create/hash", domain.AlertCard{AlertID: "rule/r/create/hash", RuleName: "r"}); err != ErrConflict {
+		t.Fatalf("expected conflict on duplicate create, got %v", err)
+	}
+
 	rev, err := store.PutCard(ctx, "rule/r/v/hash", domain.AlertCard{AlertID: "rule/r/v/hash", RuleName: "r", State: domain.AlertStateFiring})
 	if err != nil {
 		t.Fatalf("put card: %v", err)

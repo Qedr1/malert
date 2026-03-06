@@ -51,6 +51,24 @@ func TestMemoryStoreCardLifecycle(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreCreateCardConflict(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryStore(time.Now)
+	card := domain.AlertCard{AlertID: "rule/r/var/hash", RuleName: "r"}
+
+	rev, err := store.CreateCard(context.Background(), card.AlertID, card)
+	if err != nil {
+		t.Fatalf("create card: %v", err)
+	}
+	if rev != 1 {
+		t.Fatalf("expected revision 1, got %d", rev)
+	}
+	if _, err := store.CreateCard(context.Background(), card.AlertID, card); err != ErrConflict {
+		t.Fatalf("expected conflict on duplicate create, got %v", err)
+	}
+}
+
 func TestMemoryStoreTickExpiry(t *testing.T) {
 	t.Parallel()
 

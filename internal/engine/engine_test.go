@@ -472,3 +472,38 @@ func TestEngineCompactStatesByMaxCap(t *testing.T) {
 		t.Fatalf("expected state c to stay")
 	}
 }
+
+func TestEngineGetLastNotified(t *testing.T) {
+	t.Parallel()
+
+	e := New()
+	now := time.Now().UTC()
+	rule := config.RuleConfig{
+		Name:      "ct",
+		AlertType: "count_total",
+	}
+	value := 1.0
+	event := domain.Event{
+		Type:   domain.EventTypeEvent,
+		AggCnt: 1,
+		Var:    "errors",
+		Tags:   map[string]string{"dc": "dc1"},
+		Value:  domain.TypedValue{Type: "n", N: &value},
+	}
+
+	_ = e.ProcessEvent(rule, event, "rule/ct/errors/a", now)
+	if ok := e.SetLastNotified("rule/ct/errors/a", "global", now); !ok {
+		t.Fatalf("expected last_notified update to succeed")
+	}
+
+	got, exists := e.GetLastNotified("rule/ct/errors/a", "global")
+	if !exists {
+		t.Fatalf("expected keyed last_notified to exist")
+	}
+	if !got.Equal(now) {
+		t.Fatalf("last_notified=%v want=%v", got, now)
+	}
+	if _, exists := e.GetLastNotified("rule/ct/errors/a", "missing"); exists {
+		t.Fatalf("unexpected last_notified entry for missing key")
+	}
+}

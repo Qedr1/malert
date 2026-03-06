@@ -8,7 +8,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -20,25 +23,33 @@ import (
 	"alerting/internal/notify"
 	"alerting/internal/notifyqueue"
 	"alerting/internal/state"
+	"alerting/internal/ui"
 )
 
 // Service composes runtime dependencies and process lifecycle.
 // Params: config source and shared runtime components.
 // Returns: runnable alerting service.
 type Service struct {
-	source    config.ConfigSource
-	cfg       config.Config
-	logger    *slog.Logger
-	closeLog  func()
-	store     state.Store
-	manager   *Manager
-	httpSrv   *http.Server
-	natsSub   interface{ Close() error }
-	deleteSub interface{ Close() error }
-	notifyQ   interface{ Close() error }
-	notifyPub notifyqueue.Producer
-	readyFlag atomic.Bool
-	clock     clock.Clock
+	runtimeMu      sync.Mutex
+	cfgMu          sync.RWMutex
+	source         config.ConfigSource
+	cfg            config.Config
+	logger         *slog.Logger
+	closeLog       func()
+	store          state.Store
+	manager        *Manager
+	httpSrv        *http.Server
+	uiSrv          *http.Server
+	natsSub        interface{ Close() error }
+	deleteSub      interface{ Close() error }
+	notifyQ        interface{ Close() error }
+	notifyPub      notifyqueue.Producer
+	uiRegistry     *ui.RegistryClient
+	uiDash         *ui.Dashboard
+	readyFlag      atomic.Bool
+	uiReloadWarned atomic.Bool
+	clock          clock.Clock
+	instanceID     string
 }
 
 // NewService builds service instance from config source.
@@ -65,16 +76,21 @@ func NewService(source config.ConfigSource, clk clock.Clock) (*Service, error) {
 	manager := NewManager(cfg, logger, store, dispatcher, clk)
 
 	service := &Service{
-		source:   source,
-		cfg:      cfg,
-		logger:   logger,
-		closeLog: closeLog,
-		store:    store,
-		manager:  manager,
-		clock:    clk,
+		source:     source,
+		cfg:        cfg,
+		logger:     logger,
+		closeLog:   closeLog,
+		store:      store,
+		manager:    manager,
+		clock:      clk,
+		instanceID: buildInstanceID(clk),
 	}
 
 	if err := service.buildHTTPServer(); err != nil {
+		service.cleanupInitResources()
+		return nil, err
+	}
+	if err := service.buildUIRuntime(); err != nil {
 		service.cleanupInitResources()
 		return nil, err
 	}
@@ -103,14 +119,32 @@ func (s *Service) Run(ctx context.Context) error {
 
 	errChan := make(chan error, 1)
 	go func() {
-		s.logger.Info("http server starting", "listen", s.cfg.Ingest.HTTP.Listen)
+		s.logger.Info("http server starting", "listen", s.currentConfig().Ingest.HTTP.Listen)
 		err := s.httpSrv.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errChan <- err
 		}
 	}()
+	if s.uiSrv != nil {
+		go func() {
+			s.logger.Info("ui server starting", "listen", s.currentConfig().UI.Listen)
+			err := s.uiSrv.ListenAndServe()
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errChan <- err
+			}
+		}()
+	}
+	if s.uiRegistry != nil {
+		go func() {
+			cfg := s.currentConfig()
+			if err := s.uiRegistry.Run(shutdownCtx, cfg.Ingest.HTTP.HealthPath, cfg.Ingest.HTTP.ReadyPath); err != nil && !errors.Is(err, context.Canceled) {
+				s.logger.Error("ui registry publisher failed", "error", err.Error())
+				reportRunError(errChan, fmt.Errorf("ui registry publisher failed: %w", err))
+			}
+		}()
+	}
 
-	tickInterval := time.Duration(s.cfg.Service.ResolveScanInterval) * time.Second
+	tickInterval := time.Duration(s.currentConfig().Service.ResolveScanInterval) * time.Second
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	go func() {
@@ -126,8 +160,8 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}()
 
-	if s.cfg.Service.ReloadEnabled {
-		reloadInterval := time.Duration(s.cfg.Service.ReloadIntervalSec) * time.Second
+	if s.currentConfig().Service.ReloadEnabled {
+		reloadInterval := time.Duration(s.currentConfig().Service.ReloadIntervalSec) * time.Second
 		reloadTicker := time.NewTicker(reloadInterval)
 		defer reloadTicker.Stop()
 		go func() {
@@ -179,6 +213,12 @@ func (s *Service) shutdown() error {
 		s.logger.Error("http shutdown failed", "error", err.Error())
 		markErr(fmt.Errorf("http shutdown: %w", err))
 	}
+	if s.uiSrv != nil {
+		if err := s.uiSrv.Shutdown(ctx); err != nil {
+			s.logger.Error("ui shutdown failed", "error", err.Error())
+			markErr(fmt.Errorf("ui shutdown: %w", err))
+		}
+	}
 	if s.natsSub != nil {
 		if err := s.natsSub.Close(); err != nil {
 			s.logger.Error("nats subscriber close failed", "error", err.Error())
@@ -191,14 +231,15 @@ func (s *Service) shutdown() error {
 			markErr(fmt.Errorf("delete-marker consumer close: %w", err))
 		}
 	}
-	if s.notifyQ != nil {
-		if err := s.notifyQ.Close(); err != nil {
+	notifyPub, notifyQ := s.swapNotifyRuntime(nil, nil)
+	if notifyQ != nil {
+		if err := notifyQ.Close(); err != nil {
 			s.logger.Error("notify queue worker close failed", "error", err.Error())
 			markErr(fmt.Errorf("notify queue worker close: %w", err))
 		}
 	}
-	if s.notifyPub != nil {
-		if err := s.notifyPub.Close(); err != nil {
+	if notifyPub != nil {
+		if err := notifyPub.Close(); err != nil {
 			s.logger.Error("notify queue producer close failed", "error", err.Error())
 			markErr(fmt.Errorf("notify queue producer close: %w", err))
 		}
@@ -206,6 +247,16 @@ func (s *Service) shutdown() error {
 	if err := s.store.Close(); err != nil {
 		s.logger.Error("store close failed", "error", err.Error())
 		markErr(fmt.Errorf("store close: %w", err))
+	}
+	if s.uiRegistry != nil {
+		if err := s.uiRegistry.Delete(); err != nil {
+			s.logger.Error("ui registry delete failed", "error", err.Error())
+			markErr(fmt.Errorf("ui registry delete: %w", err))
+		}
+		if err := s.uiRegistry.Close(); err != nil {
+			s.logger.Error("ui registry close failed", "error", err.Error())
+			markErr(fmt.Errorf("ui registry close: %w", err))
+		}
 	}
 	if s.closeLog != nil {
 		s.closeLog()
@@ -237,9 +288,17 @@ func (s *Service) cleanupInitResources() {
 		_ = s.httpSrv.Close()
 		s.httpSrv = nil
 	}
+	if s.uiSrv != nil {
+		_ = s.uiSrv.Close()
+		s.uiSrv = nil
+	}
 	if s.store != nil {
 		_ = s.store.Close()
 		s.store = nil
+	}
+	if s.uiRegistry != nil {
+		_ = s.uiRegistry.Close()
+		s.uiRegistry = nil
 	}
 	if s.closeLog != nil {
 		s.closeLog()
@@ -278,6 +337,33 @@ func (s *Service) buildHTTPServer() error {
 	s.httpSrv = &http.Server{
 		Addr:              s.cfg.Ingest.HTTP.Listen,
 		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	return nil
+}
+
+// buildUIRuntime wires the optional UI dashboard server and registry runtime.
+// Params: none.
+// Returns: setup error when UI dependencies cannot be initialized.
+func (s *Service) buildUIRuntime() error {
+	cfg := s.currentConfig()
+	registryEnabled := strings.TrimSpace(cfg.UI.Service.PublicBaseURL) != ""
+	if !cfg.UI.Enabled && !registryEnabled {
+		return nil
+	}
+	registry, err := ui.NewRegistryClient(cfg.UI, cfg.Service, s.instanceID, s.clock.Now)
+	if err != nil {
+		return err
+	}
+	s.uiRegistry = registry
+	if !cfg.UI.Enabled {
+		return nil
+	}
+	s.uiDash = ui.NewDashboard(s.store, s.currentConfig, registry, s.manager, s.clock.Now)
+	server := ui.NewServer(cfg.UI, s.uiDash)
+	s.uiSrv = &http.Server{
+		Addr:              cfg.UI.Listen,
+		Handler:           server.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	return nil
@@ -327,12 +413,21 @@ func (s *Service) buildDeleteConsumer() error {
 // Params: context for cleanup operations.
 // Returns: reload or apply error.
 func (s *Service) reloadConfig(ctx context.Context) error {
+	current := s.currentConfig()
 	nextCfg, err := config.LoadSnapshot(s.source)
 	if err != nil {
 		return err
 	}
-	if isSingleMode(nextCfg) != isSingleMode(s.cfg) {
+	if isSingleMode(nextCfg) != isSingleMode(current) {
 		return fmt.Errorf("service.mode change requires restart")
+	}
+	if !reflect.DeepEqual(nextCfg.UI, current.UI) {
+		nextCfg.UI = current.UI
+		if s.uiReloadWarned.CompareAndSwap(false, true) {
+			s.logger.Warn("ui configuration changes ignored until restart")
+		}
+	} else {
+		s.uiReloadWarned.Store(false)
 	}
 	nextDispatcher := notify.NewDispatcher(nextCfg.Notify, s.logger)
 	nextProducer, nextWorker, err := s.buildNotifyQueueRuntime(nextCfg)
@@ -348,17 +443,16 @@ func (s *Service) reloadConfig(ctx context.Context) error {
 		}
 		return err
 	}
-	if s.notifyQ != nil {
-		_ = s.notifyQ.Close()
+	prevProducer, prevWorker := s.swapNotifyRuntime(nextProducer, nextWorker)
+	if prevWorker != nil {
+		_ = prevWorker.Close()
 	}
-	if s.notifyPub != nil {
-		_ = s.notifyPub.Close()
+	if prevProducer != nil {
+		_ = prevProducer.Close()
 	}
-	s.notifyQ = nextWorker
-	s.notifyPub = nextProducer
 	s.manager.SetDispatcher(nextDispatcher)
 	s.manager.SetQueueProducer(nextProducer)
-	s.cfg = nextCfg
+	s.setConfig(nextCfg)
 	s.logger.Info("configuration reloaded")
 	return nil
 }
@@ -371,10 +465,22 @@ func (s *Service) buildNotifyQueue() error {
 	if err != nil {
 		return err
 	}
-	s.notifyPub = producer
-	s.notifyQ = worker
+	s.swapNotifyRuntime(producer, worker)
 	s.manager.SetQueueProducer(producer)
 	return nil
+}
+
+// swapNotifyRuntime atomically swaps current notify queue producer/worker pair.
+// Params: next producer and worker handles (nil clears current runtime).
+// Returns: previous producer and worker handles.
+func (s *Service) swapNotifyRuntime(producer notifyqueue.Producer, worker interface{ Close() error }) (notifyqueue.Producer, interface{ Close() error }) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
+	prevProducer := s.notifyPub
+	prevWorker := s.notifyQ
+	s.notifyPub = producer
+	s.notifyQ = worker
+	return prevProducer, prevWorker
 }
 
 // buildNotifyQueueRuntime creates queue producer/worker pair from config snapshot.
@@ -413,4 +519,31 @@ func buildStore(cfg config.Config, clk clock.Clock) (state.Store, error) {
 
 func isSingleMode(cfg config.Config) bool {
 	return config.NormalizeServiceMode(cfg.Service.Mode) == config.ServiceModeSingle
+}
+
+func (s *Service) currentConfig() config.Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg
+}
+
+func (s *Service) setConfig(cfg config.Config) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.cfg = cfg
+}
+
+func buildInstanceID(clk clock.Clock) string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "unknown"
+	}
+	return host + ":" + strconv.Itoa(os.Getpid()) + ":" + strconv.FormatInt(clk.Now().UTC().Unix(), 10)
+}
+
+func reportRunError(errChan chan<- error, err error) {
+	select {
+	case errChan <- err:
+	default:
+	}
 }

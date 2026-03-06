@@ -282,6 +282,98 @@ workers = -1`,
 	}
 }
 
+func TestLoadSnapshotUIDefaults(t *testing.T) {
+	t.Parallel()
+
+	cfg := mustLoadSnapshot(t, joinSections(
+		serviceSection(""),
+		ingestHTTPEnabled,
+		httpNotifySection("http://127.0.0.1:18090/notify", "http_default", "{{ .Message }}"),
+		uiSection(true, "ops", "secret", "http://127.0.0.1:8080"),
+		countTotalRule(routeBlock("http", "http_default")),
+	))
+
+	if !cfg.UI.Enabled {
+		t.Fatalf("expected ui enabled")
+	}
+	if cfg.UI.Listen != ":8090" {
+		t.Fatalf("unexpected ui listen %q", cfg.UI.Listen)
+	}
+	if cfg.UI.BasePath != "/ui" {
+		t.Fatalf("unexpected ui base path %q", cfg.UI.BasePath)
+	}
+	if len(cfg.UI.NATS.URL) != 1 || cfg.UI.NATS.URL[0] != "nats://127.0.0.1:4222" {
+		t.Fatalf("unexpected ui nats urls: %#v", cfg.UI.NATS.URL)
+	}
+	if cfg.UI.NATS.RegistryBucket != "ui_registry" {
+		t.Fatalf("unexpected registry bucket %q", cfg.UI.NATS.RegistryBucket)
+	}
+}
+
+func TestLoadSnapshotUIValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		section string
+		wantErr string
+	}{
+		{
+			name: "missing auth",
+			section: joinSections(
+				`[ui]
+enabled = true`,
+				`[ui.service]
+public_base_url = "http://127.0.0.1:8080"`,
+			),
+			wantErr: "ui.auth.basic.enabled",
+		},
+		{
+			name: "missing public base url",
+			section: joinSections(
+				`[ui]
+enabled = true`,
+				`[ui.auth.basic]
+enabled = true
+username = "ops"
+password = "secret"`,
+			),
+			wantErr: "ui.service.public_base_url",
+		},
+		{
+			name: "invalid public base url",
+			section: joinSections(
+				`[ui]
+enabled = true`,
+				`[ui.auth.basic]
+enabled = true
+username = "ops"
+password = "secret"`,
+				`[ui.service]
+public_base_url = "://bad"`,
+			),
+			wantErr: "ui.service.public_base_url",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := loadSnapshotErr(t, joinSections(
+				serviceSection(""),
+				ingestHTTPEnabled,
+				httpNotifySection("http://127.0.0.1:18090/notify", "http_default", "{{ .Message }}"),
+				tt.section,
+				countTotalRule(routeBlock("http", "http_default")),
+			))
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadSnapshotSingleModeBehavior(t *testing.T) {
 	t.Parallel()
 
@@ -917,6 +1009,19 @@ url = %q`, url),
 		fmt.Sprintf(`[[notify.http.name-template]]
 name = %q
 message = %q`, templateName, message),
+	)
+}
+
+func uiSection(enabled bool, username, password, publicBaseURL string) string {
+	return joinSections(
+		fmt.Sprintf(`[ui]
+enabled = %t`, enabled),
+		fmt.Sprintf(`[ui.auth.basic]
+enabled = true
+username = %q
+password = %q`, username, password),
+		fmt.Sprintf(`[ui.service]
+public_base_url = %q`, publicBaseURL),
 	)
 }
 

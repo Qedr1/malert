@@ -15,16 +15,16 @@ import (
 // newServiceFromConfig creates Service from file config path for e2e scenarios.
 // Params: test handle and absolute config path.
 // Returns: initialized service instance.
-func newServiceFromConfig(t *testing.T, path string) *app.Service {
-	t.Helper()
+func newServiceFromConfig(tb testing.TB, path string) *app.Service {
+	tb.Helper()
 
 	source, err := config.FromCLI(path, "")
 	if err != nil {
-		t.Fatalf("config source: %v", err)
+		tb.Fatalf("config source: %v", err)
 	}
 	service, err := app.NewService(source, clock.RealClock{})
 	if err != nil {
-		t.Fatalf("new service: %v", err)
+		tb.Fatalf("new service: %v", err)
 	}
 	return service
 }
@@ -32,8 +32,8 @@ func newServiceFromConfig(t *testing.T, path string) *app.Service {
 // runService starts service in background with cancellable context.
 // Params: test handle and initialized service.
 // Returns: cancel callback and done channel with Run result.
-func runService(t *testing.T, service *app.Service) (context.CancelFunc, <-chan error) {
-	t.Helper()
+func runService(tb testing.TB, service *app.Service) (context.CancelFunc, <-chan error) {
+	tb.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -46,10 +46,10 @@ func runService(t *testing.T, service *app.Service) (context.CancelFunc, <-chan 
 // waitReady waits for /readyz endpoint to return 200.
 // Params: test handle and HTTP port.
 // Returns: service is ready or test fails on timeout.
-func waitReady(t *testing.T, port int) {
-	t.Helper()
+func waitReady(tb testing.TB, port int) {
+	tb.Helper()
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	waitFor(t, 8*time.Second, func() bool {
+	waitFor(tb, 8*time.Second, func() bool {
 		response, err := http.Get(baseURL + "/readyz")
 		if err != nil {
 			return false
@@ -62,14 +62,14 @@ func waitReady(t *testing.T, port int) {
 // waitServiceStop asserts service Run exits without error after cancellation.
 // Params: test handle and done channel returned by runService.
 // Returns: test fails if stop timeout/error happens.
-func waitServiceStop(t *testing.T, done <-chan error) {
-	t.Helper()
+func waitServiceStop(tb testing.TB, done <-chan error) {
+	tb.Helper()
 	select {
 	case runErr := <-done:
 		if runErr != nil {
-			t.Fatalf("service run error: %v", runErr)
+			tb.Fatalf("service run error: %v", runErr)
 		}
 	case <-time.After(8 * time.Second):
-		t.Fatalf("service did not stop after cancel")
+		tb.Fatalf("service did not stop after cancel")
 	}
 }

@@ -108,7 +108,7 @@ func freePort() (int, error) {
 	return listener.Addr().(*net.TCPAddr).Port, nil
 }
 
-func waitFor(t *testing.T, timeout time.Duration, check func() bool) {
+func waitFor(tb testing.TB, timeout time.Duration, check func() bool) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if check() {
@@ -116,5 +116,5 @@ func waitFor(t *testing.T, timeout time.Duration, check func() bool) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("timeout waiting for condition")
+	tb.Fatalf("timeout waiting for condition")
 }

@@ -1,0 +1,6 @@
+*.pprof
+*.test
+tmp_p12*.log
+tmp_p12*.txt
+tmp_p12*.tsv
+tmp_p12*.out

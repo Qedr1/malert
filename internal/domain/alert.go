@@ -25,6 +25,7 @@ type AlertCard struct {
 	Var          string            `json:"var"`
 	Tags         map[string]string `json:"tags"`
 	MetricValue  string            `json:"metric_value,omitempty"`
+	EventCount   int64             `json:"event_count,omitempty"`
 	ExternalRefs map[string]string `json:"external_refs,omitempty"`
 	State        AlertState        `json:"state"`
 	RaisedAt     time.Time         `json:"raised_at"`

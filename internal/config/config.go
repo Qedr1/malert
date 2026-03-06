@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,6 +19,14 @@ import (
 
 const (
 	defaultHTTPListen          = ":8080"
+	defaultUIListen            = ":8090"
+	defaultUIBasePath          = "/ui"
+	defaultUIRefreshSec        = 2
+	defaultUIRegistryBucket    = "ui_registry"
+	defaultUIRegistryTTLSec    = 30
+	defaultUIStaleAfterSec     = 10
+	defaultUIOfflineAfterSec   = 20
+	defaultUIHealthTimeoutSec  = 2
 	defaultHealthPath          = "/healthz"
 	defaultReadyPath           = "/readyz"
 	defaultIngestPath          = "/ingest"
@@ -162,6 +171,7 @@ type Config struct {
 	Log     LogConfig     `toml:"log"`
 	Ingest  IngestConfig  `toml:"ingest"`
 	Notify  NotifyConfig  `toml:"notify"`
+	UI      UIConfig      `toml:"ui"`
 	Rule    []RuleConfig  `toml:"rule"`
 }
 
@@ -173,6 +183,7 @@ type rawConfig struct {
 	Log     LogConfig                `toml:"log"`
 	Ingest  IngestConfig             `toml:"ingest"`
 	Notify  NotifyConfig             `toml:"notify"`
+	UI      UIConfig                 `toml:"ui"`
 	Rule    map[string]rawRuleConfig `toml:"rule"`
 }
 
@@ -291,6 +302,61 @@ type NotifyConfig struct {
 	Mattermost       MattermostConfig `toml:"mattermost"`
 	Jira             TrackerNotifier  `toml:"jira"`
 	YouTrack         TrackerNotifier  `toml:"youtrack"`
+}
+
+// UIConfig defines built-in dashboard settings.
+// Params: enable flag, listen/base path, auth, registry, and probe controls.
+// Returns: UI runtime options.
+type UIConfig struct {
+	Enabled    bool            `toml:"enabled"`
+	Listen     string          `toml:"listen"`
+	BasePath   string          `toml:"base_path"`
+	RefreshSec int             `toml:"refresh_sec"`
+	Auth       UIAuthConfig    `toml:"auth"`
+	NATS       UINATSConfig    `toml:"nats"`
+	Health     UIHealthConfig  `toml:"health"`
+	Service    UIServiceConfig `toml:"service"`
+}
+
+// UIAuthConfig groups UI authentication methods.
+// Params: nested auth method configs.
+// Returns: auth controls for dashboard routes.
+type UIAuthConfig struct {
+	Basic UIBasicAuthConfig `toml:"basic"`
+}
+
+// UIBasicAuthConfig defines basic-auth credentials for UI routes.
+// Params: enable flag and one username/password pair.
+// Returns: basic-auth settings.
+type UIBasicAuthConfig struct {
+	Enabled  bool   `toml:"enabled"`
+	Username string `toml:"username"`
+	Password string `toml:"password"`
+}
+
+// UINATSConfig defines discovery registry settings for the UI subsystem.
+// Params: NATS URLs, KV bucket, and freshness thresholds.
+// Returns: registry connectivity and status thresholds.
+type UINATSConfig struct {
+	URL             []string `toml:"url"`
+	RegistryBucket  string   `toml:"registry_bucket"`
+	RegistryTTLSec  int      `toml:"registry_ttl_sec"`
+	StaleAfterSec   int      `toml:"stale_after_sec"`
+	OfflineAfterSec int      `toml:"offline_after_sec"`
+}
+
+// UIHealthConfig defines health-probe behavior against discovered services.
+// Params: request timeout in seconds.
+// Returns: probe client settings.
+type UIHealthConfig struct {
+	TimeoutSec int `toml:"timeout_sec"`
+}
+
+// UIServiceConfig defines how this service advertises probe endpoints.
+// Params: externally reachable base URL for health/ready probes.
+// Returns: discovery metadata source for this process.
+type UIServiceConfig struct {
+	PublicBaseURL string `toml:"public_base_url"`
 }
 
 // NotifyQueue defines asynchronous delivery queue settings.
@@ -551,6 +617,27 @@ type RuleNotifyOff struct {
 	Days []string `toml:"days"`
 	From string   `toml:"from"`
 	To   string   `toml:"to"`
+
+	compiled *CompiledNotifyOffWindow `toml:"-"`
+}
+
+// CompiledNotifyOffWindow stores parsed off-window data for runtime checks.
+// Params: normalized weekdays and time boundaries.
+// Returns: reusable notify.off runtime structure.
+type CompiledNotifyOffWindow struct {
+	Weekdays map[time.Weekday]struct{}
+	From     int
+	To       int
+}
+
+// SetCompiled stores precompiled runtime window on config entry.
+// Params: compiled window built during normalization.
+// Returns: config entry mutated in place.
+func (w *RuleNotifyOff) SetCompiled(compiled *CompiledNotifyOffWindow) {
+	if w == nil {
+		return
+	}
+	w.compiled = compiled
 }
 
 // RuleOutOfOrder defines safeguards for delayed/future events.
@@ -629,6 +716,7 @@ func ResolveTimeout(rule RuleConfig) time.Duration {
 // Returns: merge behavior hints for zero-value bool overrides.
 type configMergeHints struct {
 	Notify notifyMergeHints `toml:"notify"`
+	UI     uiMergeHints     `toml:"ui"`
 }
 
 // notifyMergeHints tracks explicit bool fields in notify section.
@@ -661,6 +749,56 @@ type channelMergeHints struct {
 	Enabled *bool `toml:"enabled"`
 }
 
+// uiMergeHints tracks explicit bool fields in ui section.
+// Params: sparse ui values decoded from one TOML fragment.
+// Returns: bool-presence markers for merge logic.
+type uiMergeHints struct {
+	Enabled boolMergeHint    `toml:"enabled"`
+	Auth    uiAuthMergeHints `toml:"auth"`
+}
+
+// uiAuthMergeHints tracks explicit bool fields in ui.auth section.
+// Params: sparse auth fields decoded from one TOML fragment.
+// Returns: bool-presence markers for auth merge logic.
+type uiAuthMergeHints struct {
+	Basic uiBasicAuthMergeHints `toml:"basic"`
+}
+
+// uiBasicAuthMergeHints tracks explicit bool fields in ui.auth.basic section.
+// Params: sparse basic-auth fields decoded from one TOML fragment.
+// Returns: bool-presence markers for auth merge logic.
+type uiBasicAuthMergeHints struct {
+	Enabled boolMergeHint `toml:"enabled"`
+}
+
+// boolMergeHint stores explicit bool presence for one scalar key.
+// Params: decoded bool value and presence marker.
+// Returns: merge-time explicit bool state.
+type boolMergeHint struct {
+	value   bool
+	present bool
+}
+
+// UnmarshalTOML decodes one bool and records explicit presence.
+// Params: raw TOML scalar.
+// Returns: type error for non-bool values.
+func (h *boolMergeHint) UnmarshalTOML(v interface{}) error {
+	value, ok := v.(bool)
+	if !ok {
+		return fmt.Errorf("unsupported bool hint type %T", v)
+	}
+	h.value = value
+	h.present = true
+	return nil
+}
+
+// hasExplicitBool reports whether ui fragment contains explicit bool keys.
+// Params: ui merge hints from one TOML fragment.
+// Returns: true when at least one bool was explicitly set.
+func (h uiMergeHints) hasExplicitBool() bool {
+	return h.Enabled.present || h.Auth.Basic.Enabled.present
+}
+
 // hasExplicitBool reports whether notify fragment contains explicit bool keys.
 // Params: notify merge hints from one TOML fragment.
 // Returns: true when at least one bool was explicitly set.
@@ -686,6 +824,7 @@ func normalizeRawConfig(raw rawConfig) (Config, error) {
 		Log:     raw.Log,
 		Ingest:  raw.Ingest,
 		Notify:  raw.Notify,
+		UI:      raw.UI,
 	}
 	if len(raw.Rule) == 0 {
 		return cfg, nil
@@ -841,6 +980,9 @@ func mergeConfig(dst *Config, src Config, hints configMergeHints) {
 	if hasNotifyConfig(src.Notify) || hints.Notify.hasExplicitBool() {
 		mergeNotifyConfig(&dst.Notify, src.Notify, hints.Notify)
 	}
+	if hasUIConfig(src.UI) || hints.UI.hasExplicitBool() {
+		mergeUIConfig(&dst.UI, src.UI, hints.UI)
+	}
 	if len(src.Rule) > 0 {
 		dst.Rule = append(dst.Rule, src.Rule...)
 	}
@@ -851,12 +993,8 @@ func mergeConfig(dst *Config, src Config, hints configMergeHints) {
 // Returns: merged notify configuration side-effect in dst.
 func mergeNotifyConfig(dst *NotifyConfig, src NotifyConfig, hints notifyMergeHints) {
 	applyBoolMerge(&dst.Repeat, src.Repeat, hints.Repeat)
-	if src.RepeatEverySec != 0 {
-		dst.RepeatEverySec = src.RepeatEverySec
-	}
-	if len(src.RepeatOn) > 0 {
-		dst.RepeatOn = append([]string(nil), src.RepeatOn...)
-	}
+	mergeNonZeroInt(&dst.RepeatEverySec, src.RepeatEverySec)
+	replaceSlice(&dst.RepeatOn, src.RepeatOn)
 	applyBoolMerge(&dst.RepeatPerChannel, src.RepeatPerChannel, hints.RepeatPerChannel)
 	applyBoolMerge(&dst.OnPending, src.OnPending, hints.OnPending)
 	mergeNotifyQueue(&dst.Queue, src.Queue, hints.Queue)
@@ -867,136 +1005,85 @@ func mergeNotifyConfig(dst *NotifyConfig, src NotifyConfig, hints notifyMergeHin
 	mergeTrackerNotifier(&dst.YouTrack, src.YouTrack, hints.YouTrack)
 }
 
+// mergeUIConfig overlays UI fragment into destination preserving sibling fields.
+// Params: destination UI config and fragment from one source file.
+// Returns: merged UI configuration side-effect in dst.
+func mergeUIConfig(dst *UIConfig, src UIConfig, hints uiMergeHints) {
+	applyBoolHintMerge(&dst.Enabled, hints.Enabled)
+	mergeString(&dst.Listen, src.Listen)
+	mergeString(&dst.BasePath, src.BasePath)
+	mergeNonZeroInt(&dst.RefreshSec, src.RefreshSec)
+	applyBoolHintMerge(&dst.Auth.Basic.Enabled, hints.Auth.Basic.Enabled)
+	mergeString(&dst.Auth.Basic.Username, src.Auth.Basic.Username)
+	mergeString(&dst.Auth.Basic.Password, src.Auth.Basic.Password)
+	replaceSlice(&dst.NATS.URL, src.NATS.URL)
+	mergeString(&dst.NATS.RegistryBucket, src.NATS.RegistryBucket)
+	mergeNonZeroInt(&dst.NATS.RegistryTTLSec, src.NATS.RegistryTTLSec)
+	mergeNonZeroInt(&dst.NATS.StaleAfterSec, src.NATS.StaleAfterSec)
+	mergeNonZeroInt(&dst.NATS.OfflineAfterSec, src.NATS.OfflineAfterSec)
+	mergeNonZeroInt(&dst.Health.TimeoutSec, src.Health.TimeoutSec)
+	mergeString(&dst.Service.PublicBaseURL, src.Service.PublicBaseURL)
+}
+
 // mergeNotifyQueue overlays async queue config preserving other notify fields.
-// Params: destination queue config and source fragment.
-// Returns: merged queue config side-effect in dst.
 func mergeNotifyQueue(dst *NotifyQueue, src NotifyQueue, hints queueMergeHints) {
 	applyBoolMerge(&dst.Enabled, src.Enabled, hints.Enabled)
-	if src.AckWaitSec != 0 {
-		dst.AckWaitSec = src.AckWaitSec
-	}
-	if src.NackDelayMS != 0 {
-		dst.NackDelayMS = src.NackDelayMS
-	}
-	if src.MaxDeliver != 0 {
-		dst.MaxDeliver = src.MaxDeliver
-	}
-	if src.MaxAckPending != 0 {
-		dst.MaxAckPending = src.MaxAckPending
-	}
+	mergeNonZeroInt(&dst.AckWaitSec, src.AckWaitSec)
+	mergeNonZeroInt(&dst.NackDelayMS, src.NackDelayMS)
+	mergeNonZeroInt(&dst.MaxDeliver, src.MaxDeliver)
+	mergeNonZeroInt(&dst.MaxAckPending, src.MaxAckPending)
 	applyBoolMerge(&dst.DLQ, src.DLQ, hints.DLQ)
 }
 
 // mergeTelegramNotifier overlays telegram transport config preserving other notify fields.
-// Params: destination telegram config and source fragment.
-// Returns: merged telegram configuration side-effect in dst.
 func mergeTelegramNotifier(dst *TelegramNotifier, src TelegramNotifier, hints channelMergeHints) {
 	applyBoolMerge(&dst.Enabled, src.Enabled, hints.Enabled)
-	if strings.TrimSpace(src.BotToken) != "" {
-		dst.BotToken = src.BotToken
-	}
-	if strings.TrimSpace(src.ChatID) != "" {
-		dst.ChatID = src.ChatID
-	}
-	if strings.TrimSpace(src.ActiveChatID) != "" {
-		dst.ActiveChatID = src.ActiveChatID
-	}
-	if strings.TrimSpace(src.APIBase) != "" {
-		dst.APIBase = src.APIBase
-	}
-	if src.Retry != (NotifyRetry{}) {
-		dst.Retry = src.Retry
-	}
-	if len(src.NameTemplate) > 0 {
-		dst.NameTemplate = append(dst.NameTemplate, src.NameTemplate...)
-	}
+	mergeString(&dst.BotToken, src.BotToken)
+	mergeString(&dst.ChatID, src.ChatID)
+	mergeString(&dst.ActiveChatID, src.ActiveChatID)
+	mergeString(&dst.APIBase, src.APIBase)
+	mergeRetry(&dst.Retry, src.Retry)
+	appendSlice(&dst.NameTemplate, src.NameTemplate)
 }
 
 // mergeHTTPNotifier overlays HTTP transport config preserving other notify fields.
-// Params: destination http config and source fragment.
-// Returns: merged http configuration side-effect in dst.
 func mergeHTTPNotifier(dst *HTTPNotifier, src HTTPNotifier, hints channelMergeHints) {
 	applyBoolMerge(&dst.Enabled, src.Enabled, hints.Enabled)
-	if strings.TrimSpace(src.URL) != "" {
-		dst.URL = src.URL
-	}
-	if strings.TrimSpace(src.Method) != "" {
-		dst.Method = src.Method
-	}
-	if src.TimeoutSec != 0 {
-		dst.TimeoutSec = src.TimeoutSec
-	}
-	if len(src.Headers) > 0 {
-		if dst.Headers == nil {
-			dst.Headers = make(map[string]string, len(src.Headers))
-		}
-		for key, value := range src.Headers {
-			dst.Headers[key] = value
-		}
-	}
-	if src.Retry != (NotifyRetry{}) {
-		dst.Retry = src.Retry
-	}
-	if len(src.NameTemplate) > 0 {
-		dst.NameTemplate = append(dst.NameTemplate, src.NameTemplate...)
-	}
+	mergeString(&dst.URL, src.URL)
+	mergeString(&dst.Method, src.Method)
+	mergeNonZeroInt(&dst.TimeoutSec, src.TimeoutSec)
+	mergeStringMap(&dst.Headers, src.Headers)
+	mergeRetry(&dst.Retry, src.Retry)
+	appendSlice(&dst.NameTemplate, src.NameTemplate)
 }
 
 // mergeMattermostNotifier overlays mattermost transport config preserving other notify fields.
-// Params: destination mattermost config and source fragment.
-// Returns: merged mattermost configuration side-effect in dst.
 func mergeMattermostNotifier(dst *MattermostConfig, src MattermostConfig, hints channelMergeHints) {
 	applyBoolMerge(&dst.Enabled, src.Enabled, hints.Enabled)
-	if strings.TrimSpace(src.BaseURL) != "" {
-		dst.BaseURL = src.BaseURL
-	}
-	if strings.TrimSpace(src.BotToken) != "" {
-		dst.BotToken = src.BotToken
-	}
-	if strings.TrimSpace(src.ChannelID) != "" {
-		dst.ChannelID = src.ChannelID
-	}
-	if strings.TrimSpace(src.ActiveChannelID) != "" {
-		dst.ActiveChannelID = src.ActiveChannelID
-	}
-	if src.TimeoutSec != 0 {
-		dst.TimeoutSec = src.TimeoutSec
-	}
-	if src.Retry != (NotifyRetry{}) {
-		dst.Retry = src.Retry
-	}
-	if len(src.NameTemplate) > 0 {
-		dst.NameTemplate = append(dst.NameTemplate, src.NameTemplate...)
-	}
+	mergeString(&dst.BaseURL, src.BaseURL)
+	mergeString(&dst.BotToken, src.BotToken)
+	mergeString(&dst.ChannelID, src.ChannelID)
+	mergeString(&dst.ActiveChannelID, src.ActiveChannelID)
+	mergeNonZeroInt(&dst.TimeoutSec, src.TimeoutSec)
+	mergeRetry(&dst.Retry, src.Retry)
+	appendSlice(&dst.NameTemplate, src.NameTemplate)
 }
 
 // mergeTrackerNotifier overlays tracker transport config preserving other notify fields.
-// Params: destination tracker config and source fragment.
-// Returns: merged tracker configuration side-effect in dst.
 func mergeTrackerNotifier(dst *TrackerNotifier, src TrackerNotifier, hints channelMergeHints) {
 	applyBoolMerge(&dst.Enabled, src.Enabled, hints.Enabled)
-	if strings.TrimSpace(src.BaseURL) != "" {
-		dst.BaseURL = src.BaseURL
-	}
-	if src.TimeoutSec != 0 {
-		dst.TimeoutSec = src.TimeoutSec
-	}
+	mergeString(&dst.BaseURL, src.BaseURL)
+	mergeNonZeroInt(&dst.TimeoutSec, src.TimeoutSec)
 	if src.Auth != (TrackerAuthConfig{}) {
 		dst.Auth = src.Auth
 	}
 	mergeTrackerActionConfig(&dst.Create, src.Create)
 	mergeTrackerActionConfig(&dst.Resolve, src.Resolve)
-	if src.Retry != (NotifyRetry{}) {
-		dst.Retry = src.Retry
-	}
-	if len(src.NameTemplate) > 0 {
-		dst.NameTemplate = append(dst.NameTemplate, src.NameTemplate...)
-	}
+	mergeRetry(&dst.Retry, src.Retry)
+	appendSlice(&dst.NameTemplate, src.NameTemplate)
 }
 
 // applyBoolMerge merges bool with explicit-value awareness for directory overlays.
-// Params: destination bool pointer, source decoded bool, and explicit source marker.
-// Returns: merged bool side-effect in dst.
 func applyBoolMerge(dst *bool, value bool, explicit *bool) {
 	if explicit != nil {
 		*dst = *explicit
@@ -1007,98 +1094,151 @@ func applyBoolMerge(dst *bool, value bool, explicit *bool) {
 	}
 }
 
-// mergeTrackerActionConfig overlays one tracker action fragment.
-// Params: destination action and source fragment.
-// Returns: merged action settings side-effect in dst.
-func mergeTrackerActionConfig(dst *TrackerActionConfig, src TrackerActionConfig) {
-	if strings.TrimSpace(src.Method) != "" {
-		dst.Method = src.Method
-	}
-	if strings.TrimSpace(src.Path) != "" {
-		dst.Path = src.Path
-	}
-	if len(src.Headers) > 0 {
-		if dst.Headers == nil {
-			dst.Headers = make(map[string]string, len(src.Headers))
-		}
-		for key, value := range src.Headers {
-			dst.Headers[key] = value
-		}
-	}
-	if strings.TrimSpace(src.BodyTemplate) != "" {
-		dst.BodyTemplate = src.BodyTemplate
-	}
-	if len(src.SuccessStatus) > 0 {
-		dst.SuccessStatus = append([]int(nil), src.SuccessStatus...)
-	}
-	if strings.TrimSpace(src.RefJSONPath) != "" {
-		dst.RefJSONPath = src.RefJSONPath
+// applyBoolHintMerge merges bool field using explicit-presence hint.
+// Params: destination bool and decoded hint value.
+// Returns: destination updated only when key was explicitly present.
+func applyBoolHintMerge(dst *bool, hint boolMergeHint) {
+	if hint.present {
+		*dst = hint.value
 	}
 }
 
+// mergeString copies non-blank string values into destination.
+func mergeString(dst *string, src string) {
+	if strings.TrimSpace(src) != "" {
+		*dst = src
+	}
+}
+
+// mergeNonZeroInt copies non-zero integer values into destination.
+func mergeNonZeroInt(dst *int, src int) {
+	if src != 0 {
+		*dst = src
+	}
+}
+
+// mergeRetry copies non-zero retry config into destination.
+func mergeRetry(dst *NotifyRetry, src NotifyRetry) {
+	if src != (NotifyRetry{}) {
+		*dst = src
+	}
+}
+
+// mergeStringMap overlays source entries into destination map.
+func mergeStringMap(dst *map[string]string, src map[string]string) {
+	if len(src) == 0 {
+		return
+	}
+	if *dst == nil {
+		*dst = make(map[string]string, len(src))
+	}
+	for key, value := range src {
+		(*dst)[key] = value
+	}
+}
+
+// replaceSlice replaces destination slice with a cloned source slice when provided.
+func replaceSlice[T any](dst *[]T, src []T) {
+	if len(src) > 0 {
+		*dst = append([]T(nil), src...)
+	}
+}
+
+// appendSlice appends source values into destination slice when provided.
+func appendSlice[T any](dst *[]T, src []T) {
+	if len(src) > 0 {
+		*dst = append(*dst, src...)
+	}
+}
+
+// mergeTrackerActionConfig overlays one tracker action fragment.
+func mergeTrackerActionConfig(dst *TrackerActionConfig, src TrackerActionConfig) {
+	mergeString(&dst.Method, src.Method)
+	mergeString(&dst.Path, src.Path)
+	mergeStringMap(&dst.Headers, src.Headers)
+	mergeString(&dst.BodyTemplate, src.BodyTemplate)
+	replaceSlice(&dst.SuccessStatus, src.SuccessStatus)
+	mergeString(&dst.RefJSONPath, src.RefJSONPath)
+}
+
 // hasNotifyConfig checks whether notify section contains any explicit values.
-// Params: notify configuration fragment.
-// Returns: true when section should be merged into destination snapshot.
 func hasNotifyConfig(cfg NotifyConfig) bool {
-	if cfg.Repeat || cfg.RepeatEverySec != 0 || len(cfg.RepeatOn) > 0 || cfg.RepeatPerChannel || cfg.OnPending {
-		return true
-	}
-	if cfg.Queue.Enabled ||
-		cfg.Queue.AckWaitSec != 0 ||
-		cfg.Queue.NackDelayMS != 0 ||
-		cfg.Queue.MaxDeliver != 0 ||
-		cfg.Queue.MaxAckPending != 0 ||
-		cfg.Queue.DLQ {
-		return true
-	}
-	if cfg.Telegram.Enabled ||
-		strings.TrimSpace(cfg.Telegram.BotToken) != "" ||
-		strings.TrimSpace(cfg.Telegram.ChatID) != "" ||
-		strings.TrimSpace(cfg.Telegram.ActiveChatID) != "" ||
-		strings.TrimSpace(cfg.Telegram.APIBase) != "" ||
+	return cfg.Repeat ||
+		cfg.RepeatEverySec != 0 ||
+		len(cfg.RepeatOn) > 0 ||
+		cfg.RepeatPerChannel ||
+		cfg.OnPending ||
+		cfg.Queue.Enabled ||
+		cfg.Queue.DLQ ||
+		hasAnyNonZero(cfg.Queue.AckWaitSec, cfg.Queue.NackDelayMS, cfg.Queue.MaxDeliver, cfg.Queue.MaxAckPending) ||
+		cfg.Telegram.Enabled ||
+		hasAnyString(cfg.Telegram.BotToken, cfg.Telegram.ChatID, cfg.Telegram.ActiveChatID, cfg.Telegram.APIBase) ||
 		cfg.Telegram.Retry != (NotifyRetry{}) ||
-		len(cfg.Telegram.NameTemplate) > 0 {
-		return true
-	}
-	if cfg.HTTP.Enabled || strings.TrimSpace(cfg.HTTP.URL) != "" || strings.TrimSpace(cfg.HTTP.Method) != "" || cfg.HTTP.TimeoutSec != 0 || len(cfg.HTTP.Headers) > 0 || cfg.HTTP.Retry != (NotifyRetry{}) || len(cfg.HTTP.NameTemplate) > 0 {
-		return true
-	}
-	if cfg.Mattermost.Enabled ||
-		strings.TrimSpace(cfg.Mattermost.BaseURL) != "" ||
-		strings.TrimSpace(cfg.Mattermost.BotToken) != "" ||
-		strings.TrimSpace(cfg.Mattermost.ChannelID) != "" ||
-		strings.TrimSpace(cfg.Mattermost.ActiveChannelID) != "" ||
+		len(cfg.Telegram.NameTemplate) > 0 ||
+		cfg.HTTP.Enabled ||
+		hasAnyString(cfg.HTTP.URL, cfg.HTTP.Method) ||
+		cfg.HTTP.TimeoutSec != 0 ||
+		len(cfg.HTTP.Headers) > 0 ||
+		cfg.HTTP.Retry != (NotifyRetry{}) ||
+		len(cfg.HTTP.NameTemplate) > 0 ||
+		cfg.Mattermost.Enabled ||
+		hasAnyString(cfg.Mattermost.BaseURL, cfg.Mattermost.BotToken, cfg.Mattermost.ChannelID, cfg.Mattermost.ActiveChannelID) ||
 		cfg.Mattermost.TimeoutSec != 0 ||
 		cfg.Mattermost.Retry != (NotifyRetry{}) ||
-		len(cfg.Mattermost.NameTemplate) > 0 {
-		return true
-	}
-	if hasTrackerNotifierConfig(cfg.Jira) || hasTrackerNotifierConfig(cfg.YouTrack) {
-		return true
+		len(cfg.Mattermost.NameTemplate) > 0 ||
+		hasTrackerNotifierConfig(cfg.Jira) ||
+		hasTrackerNotifierConfig(cfg.YouTrack)
+}
+
+// hasUIConfig checks whether UI section contains any explicit values.
+// Params: UI config fragment.
+// Returns: true when fragment should be merged.
+func hasUIConfig(cfg UIConfig) bool {
+	return cfg.Enabled ||
+		hasAnyString(cfg.Listen, cfg.BasePath, cfg.Auth.Basic.Username, cfg.Auth.Basic.Password, cfg.NATS.RegistryBucket, cfg.Service.PublicBaseURL) ||
+		cfg.RefreshSec != 0 ||
+		cfg.Auth.Basic.Enabled ||
+		len(cfg.NATS.URL) > 0 ||
+		hasAnyNonZero(cfg.NATS.RegistryTTLSec, cfg.NATS.StaleAfterSec, cfg.NATS.OfflineAfterSec, cfg.Health.TimeoutSec)
+}
+
+// hasTrackerNotifierConfig checks whether tracker section contains explicit values.
+func hasTrackerNotifierConfig(cfg TrackerNotifier) bool {
+	return cfg.Enabled ||
+		hasAnyString(cfg.BaseURL) ||
+		cfg.TimeoutSec != 0 ||
+		cfg.Auth != (TrackerAuthConfig{}) ||
+		cfg.Retry != (NotifyRetry{}) ||
+		len(cfg.NameTemplate) > 0 ||
+		hasTrackerActionConfig(cfg.Create) ||
+		hasTrackerActionConfig(cfg.Resolve)
+}
+
+// hasTrackerActionConfig checks whether tracker action section contains explicit values.
+func hasTrackerActionConfig(cfg TrackerActionConfig) bool {
+	return hasAnyString(cfg.Method, cfg.Path, cfg.BodyTemplate, cfg.RefJSONPath) ||
+		len(cfg.Headers) > 0 ||
+		len(cfg.SuccessStatus) > 0
+}
+
+// hasAnyString reports whether any string contains non-whitespace content.
+func hasAnyString(values ...string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
 	}
 	return false
 }
 
-// hasTrackerNotifierConfig checks whether tracker section contains explicit values.
-// Params: tracker notifier fragment.
-// Returns: true when tracker section should be merged.
-func hasTrackerNotifierConfig(cfg TrackerNotifier) bool {
-	if cfg.Enabled || strings.TrimSpace(cfg.BaseURL) != "" || cfg.TimeoutSec != 0 || cfg.Auth != (TrackerAuthConfig{}) || cfg.Retry != (NotifyRetry{}) || len(cfg.NameTemplate) > 0 {
-		return true
+// hasAnyNonZero reports whether any integer value is non-zero.
+func hasAnyNonZero(values ...int) bool {
+	for _, value := range values {
+		if value != 0 {
+			return true
+		}
 	}
-	return hasTrackerActionConfig(cfg.Create) || hasTrackerActionConfig(cfg.Resolve)
-}
-
-// hasTrackerActionConfig checks whether tracker action section contains explicit values.
-// Params: tracker action fragment.
-// Returns: true when action section should be merged.
-func hasTrackerActionConfig(cfg TrackerActionConfig) bool {
-	return strings.TrimSpace(cfg.Method) != "" ||
-		strings.TrimSpace(cfg.Path) != "" ||
-		len(cfg.Headers) > 0 ||
-		strings.TrimSpace(cfg.BodyTemplate) != "" ||
-		len(cfg.SuccessStatus) > 0 ||
-		strings.TrimSpace(cfg.RefJSONPath) != ""
+	return false
 }
 
 // applyDefaults fills omitted config fields with safe defaults.
@@ -1228,6 +1368,37 @@ func applyDefaults(cfg *Config) {
 	fillNotifyRetryDefaults(&cfg.Notify.Mattermost.Retry)
 	fillTrackerNotifierDefaults(&cfg.Notify.Jira)
 	fillTrackerNotifierDefaults(&cfg.Notify.YouTrack)
+
+	if strings.TrimSpace(cfg.UI.Listen) == "" {
+		cfg.UI.Listen = defaultUIListen
+	}
+	cfg.UI.BasePath = normalizeUIBasePath(cfg.UI.BasePath)
+	if cfg.UI.RefreshSec <= 0 {
+		cfg.UI.RefreshSec = defaultUIRefreshSec
+	}
+	cfg.UI.NATS.URL = normalizeNATSURLs(cfg.UI.NATS.URL)
+	if len(cfg.UI.NATS.URL) == 0 {
+		if len(cfg.Ingest.NATS.URL) > 0 {
+			cfg.UI.NATS.URL = append([]string(nil), cfg.Ingest.NATS.URL...)
+		} else {
+			cfg.UI.NATS.URL = []string{defaultNATSURL}
+		}
+	}
+	if strings.TrimSpace(cfg.UI.NATS.RegistryBucket) == "" {
+		cfg.UI.NATS.RegistryBucket = defaultUIRegistryBucket
+	}
+	if cfg.UI.NATS.RegistryTTLSec <= 0 {
+		cfg.UI.NATS.RegistryTTLSec = defaultUIRegistryTTLSec
+	}
+	if cfg.UI.NATS.StaleAfterSec <= 0 {
+		cfg.UI.NATS.StaleAfterSec = defaultUIStaleAfterSec
+	}
+	if cfg.UI.NATS.OfflineAfterSec <= 0 {
+		cfg.UI.NATS.OfflineAfterSec = defaultUIOfflineAfterSec
+	}
+	if cfg.UI.Health.TimeoutSec <= 0 {
+		cfg.UI.Health.TimeoutSec = defaultUIHealthTimeoutSec
+	}
 
 	for i := range cfg.Rule {
 		rule := &cfg.Rule[i]
@@ -1359,6 +1530,63 @@ func validateConfig(cfg Config) error {
 	}
 	if err := validateLogSink("log.file", cfg.Log.File, true); err != nil {
 		return err
+	}
+	if cfg.UI.Enabled {
+		if strings.TrimSpace(cfg.UI.Listen) == "" {
+			return errors.New("ui.listen is required when ui.enabled=true")
+		}
+		if strings.TrimSpace(cfg.UI.BasePath) == "" {
+			return errors.New("ui.base_path is required when ui.enabled=true")
+		}
+		if !cfg.UI.Auth.Basic.Enabled {
+			return errors.New("ui.auth.basic.enabled must be true when ui.enabled=true")
+		}
+		if strings.TrimSpace(cfg.UI.Auth.Basic.Username) == "" {
+			return errors.New("ui.auth.basic.username is required when ui.enabled=true")
+		}
+		if strings.TrimSpace(cfg.UI.Auth.Basic.Password) == "" {
+			return errors.New("ui.auth.basic.password is required when ui.enabled=true")
+		}
+		if strings.TrimSpace(cfg.UI.Service.PublicBaseURL) == "" {
+			return errors.New("ui.service.public_base_url is required when ui.enabled=true")
+		}
+		if cfg.UI.RefreshSec <= 0 {
+			return errors.New("ui.refresh_sec must be >0 when ui.enabled=true")
+		}
+		if cfg.UI.Health.TimeoutSec <= 0 {
+			return errors.New("ui.health.timeout_sec must be >0 when ui.enabled=true")
+		}
+	}
+	if strings.TrimSpace(cfg.UI.Service.PublicBaseURL) != "" {
+		if err := validateAbsoluteHTTPURL("ui.service.public_base_url", cfg.UI.Service.PublicBaseURL); err != nil {
+			return err
+		}
+		if len(cfg.UI.NATS.URL) == 0 {
+			return errors.New("ui.nats.url is required when ui.service.public_base_url is set")
+		}
+		if strings.TrimSpace(cfg.UI.NATS.RegistryBucket) == "" {
+			return errors.New("ui.nats.registry_bucket is required when ui.service.public_base_url is set")
+		}
+	}
+	for i, url := range cfg.UI.NATS.URL {
+		if strings.TrimSpace(url) == "" {
+			return fmt.Errorf("ui.nats.url[%d] is empty", i)
+		}
+	}
+	if cfg.UI.NATS.RegistryTTLSec <= 0 {
+		return errors.New("ui.nats.registry_ttl_sec must be >0")
+	}
+	if cfg.UI.NATS.StaleAfterSec <= 0 {
+		return errors.New("ui.nats.stale_after_sec must be >0")
+	}
+	if cfg.UI.NATS.OfflineAfterSec <= 0 {
+		return errors.New("ui.nats.offline_after_sec must be >0")
+	}
+	if cfg.UI.NATS.StaleAfterSec >= cfg.UI.NATS.OfflineAfterSec {
+		return errors.New("ui.nats.stale_after_sec must be < ui.nats.offline_after_sec")
+	}
+	if cfg.UI.NATS.OfflineAfterSec >= cfg.UI.NATS.RegistryTTLSec {
+		return errors.New("ui.nats.offline_after_sec must be < ui.nats.registry_ttl_sec")
 	}
 
 	if cfg.Notify.Telegram.Enabled {
@@ -1527,7 +1755,7 @@ func validateRule(rule RuleConfig) error {
 // Returns: validation error with indexed window path.
 func validateNotifyOff(windows []RuleNotifyOff) error {
 	for index, window := range windows {
-		if err := validateNotifyOffWindow(window); err != nil {
+		if _, err := compileNotifyOffWindow(window); err != nil {
 			return fmt.Errorf("notify.off[%d]: %w", index, err)
 		}
 	}
@@ -1550,48 +1778,52 @@ func NotifyOffActiveAt(windows []RuleNotifyOff, now time.Time, loc *time.Locatio
 	prevWeekday := previousWeekday(weekday)
 
 	for index, window := range windows {
-		weekdays, err := parseNotifyOffDays(window.Days)
-		if err != nil {
-			return false, fmt.Errorf("notify.off[%d]: %w", index, err)
+		compiled := window.compiled
+		if compiled == nil {
+			var err error
+			compiled, err = compileNotifyOffWindow(window)
+			if err != nil {
+				return false, fmt.Errorf("notify.off[%d]: %w", index, err)
+			}
 		}
-		fromMinute, err := parseNotifyOffClock(window.From, false)
-		if err != nil {
-			return false, fmt.Errorf("notify.off[%d].from: %w", index, err)
-		}
-		toMinute, err := parseNotifyOffClock(window.To, true)
-		if err != nil {
-			return false, fmt.Errorf("notify.off[%d].to: %w", index, err)
-		}
-		if fromMinute == toMinute {
-			return false, fmt.Errorf("notify.off[%d]: from and to must define non-empty interval", index)
-		}
-
-		if notifyOffContainsMinute(weekdays, weekday, prevWeekday, minuteOfDay, fromMinute, toMinute) {
+		if notifyOffContainsMinute(compiled.Weekdays, weekday, prevWeekday, minuteOfDay, compiled.From, compiled.To) {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-// validateNotifyOffWindow validates one off-window definition.
+// compileNotifyOffWindow validates and compiles one off-window definition.
 // Params: one rule notify off window.
-// Returns: validation error for malformed weekdays or time interval.
-func validateNotifyOffWindow(window RuleNotifyOff) error {
-	if _, err := parseNotifyOffDays(window.Days); err != nil {
-		return err
+// Returns: compiled window or validation error.
+func compileNotifyOffWindow(window RuleNotifyOff) (*CompiledNotifyOffWindow, error) {
+	weekdays, err := parseNotifyOffDays(window.Days)
+	if err != nil {
+		return nil, err
 	}
 	fromMinute, err := parseNotifyOffClock(window.From, false)
 	if err != nil {
-		return fmt.Errorf("from: %w", err)
+		return nil, fmt.Errorf("from: %w", err)
 	}
 	toMinute, err := parseNotifyOffClock(window.To, true)
 	if err != nil {
-		return fmt.Errorf("to: %w", err)
+		return nil, fmt.Errorf("to: %w", err)
 	}
 	if fromMinute == toMinute {
-		return errors.New("from and to must define non-empty interval")
+		return nil, errors.New("from and to must define non-empty interval")
 	}
-	return nil
+	return &CompiledNotifyOffWindow{
+		Weekdays: weekdays,
+		From:     fromMinute,
+		To:       toMinute,
+	}, nil
+}
+
+// CompileNotifyOffWindow validates and compiles one off-window for reuse outside config package.
+// Params: one notify.off config entry.
+// Returns: compiled runtime window or validation error.
+func CompileNotifyOffWindow(window RuleNotifyOff) (*CompiledNotifyOffWindow, error) {
+	return compileNotifyOffWindow(window)
 }
 
 // parseNotifyOffDays parses weekday tokens into a set.
@@ -1795,6 +2027,23 @@ func normalizeNATSURLs(urls []string) []string {
 		out[i] = strings.TrimSpace(urls[i])
 	}
 	return out
+}
+
+// normalizeUIBasePath trims spaces, applies default, and keeps one leading slash.
+// Params: raw base path from config.
+// Returns: normalized UI base path.
+func normalizeUIBasePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return defaultUIBasePath
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if path != "/" {
+		path = strings.TrimRight(path, "/")
+	}
+	return path
 }
 
 // CompileWildcardPattern converts wildcard syntax (*, ?) into regex and compiles it.
@@ -2028,27 +2277,28 @@ func validateTrackerAuth(pathPrefix string, cfg TrackerAuthConfig) error {
 // Params: raw channel name from config.
 // Returns: normalized lowercase channel key.
 func NormalizeNotifyChannel(value string) string {
-	return strings.ToLower(strings.TrimSpace(value))
+	return normalizeLowerDefault(value, "")
 }
 
 // NormalizeNotifyRouteMode canonicalizes notify route mode and applies default.
 // Params: raw mode value from config.
 // Returns: normalized route mode (`history` by default).
 func NormalizeNotifyRouteMode(value string) string {
-	normalized := strings.ToLower(strings.TrimSpace(value))
-	if normalized == "" {
-		return NotifyRouteModeHistory
-	}
-	return normalized
+	return normalizeLowerDefault(value, NotifyRouteModeHistory)
 }
 
 // NormalizeServiceMode canonicalizes service mode and applies default.
 // Params: raw mode value from config.
 // Returns: normalized mode (`nats` by default).
 func NormalizeServiceMode(value string) string {
+	return normalizeLowerDefault(value, ServiceModeNATS)
+}
+
+// normalizeLowerDefault trims/lowercases a string and applies fallback when empty.
+func normalizeLowerDefault(value, fallback string) string {
 	normalized := strings.ToLower(strings.TrimSpace(value))
 	if normalized == "" {
-		return ServiceModeNATS
+		return fallback
 	}
 	return normalized
 }
@@ -2081,9 +2331,7 @@ func IsSupportedNotifyRouteMode(mode string) bool {
 // Params: none.
 // Returns: ordered channel key list.
 func NotifyChannelNames() []string {
-	out := make([]string, len(notifyChannelOrder))
-	copy(out, notifyChannelOrder)
-	return out
+	return append([]string(nil), notifyChannelOrder...)
 }
 
 // IsSupportedNotifyChannel reports whether channel key is supported.
@@ -2128,8 +2376,6 @@ func NotifyChannelTemplates(cfg NotifyConfig, channel string) []NamedTemplateCon
 }
 
 // notifyChannelDescriptorByName returns channel metadata descriptor by key.
-// Params: raw or normalized channel key.
-// Returns: descriptor and existence flag.
 func notifyChannelDescriptorByName(channel string) (notifyChannelDescriptor, bool) {
 	descriptor, exists := notifyChannelRegistry[NormalizeNotifyChannel(channel)]
 	return descriptor, exists
@@ -2173,5 +2419,25 @@ func validateLogSink(name string, sink LogSinkConfig, requirePath bool) error {
 		return fmt.Errorf("%s.path is required", name)
 	}
 
+	return nil
+}
+
+// validateAbsoluteHTTPURL checks that a value is an absolute http/https URL without query or fragment.
+// Params: config path label and raw URL string.
+// Returns: validation error when URL is malformed or unsupported.
+func validateAbsoluteHTTPURL(path, raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("%s is invalid: %w", path, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("%s must use http or https scheme", path)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("%s must include host", path)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%s must not include query or fragment", path)
+	}
 	return nil
 }

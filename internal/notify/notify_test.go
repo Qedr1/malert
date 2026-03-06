@@ -521,6 +521,29 @@ func TestHTTPScenarioSenderSend(t *testing.T) {
 	}
 }
 
+func TestExecuteRequestSkipsSuccessBodyReadWhenNotRequested(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	body, err := executeRequest(http.DefaultClient, request, "test", nil, false)
+	if err != nil {
+		t.Fatalf("execute request: %v", err)
+	}
+	if body != nil {
+		t.Fatalf("expected nil success body, got %q", string(body))
+	}
+}
+
 func TestMattermostSenderSend(t *testing.T) {
 	t.Parallel()
 

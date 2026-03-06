@@ -40,6 +40,12 @@ type tickRefresh struct {
 	ttl      time.Duration
 }
 
+type cardWriteResult struct {
+	card        domain.AlertCard
+	allowNotify bool
+	seedExtRefs bool
+}
+
 // NewManager creates manager with initial configuration.
 // Params: initial config, logger, state store, notifier dispatcher, and clock.
 // Returns: initialized manager.
@@ -164,7 +170,7 @@ func (m *Manager) Tick(ctx context.Context) error {
 			)
 
 			if !repeatPerChannel {
-				last := repeatSnapshot.LastNotified["global"]
+				last, _ := m.engine.GetLastNotified(alertID, "global")
 				if !last.IsZero() && now.Sub(last) < repeatEvery {
 					continue
 				}
@@ -175,12 +181,12 @@ func (m *Manager) Tick(ctx context.Context) error {
 			}
 
 			for _, route := range routes {
-				normalizedRoute, ok := normalizedRouteFromRuntimeRoute(route)
+				normalizedRoute, ok := normalizedNotifyRouteFromConfig(route, true)
 				if !ok {
 					continue
 				}
 				notifyKey := normalizedRoute.Key
-				last := repeatSnapshot.LastNotified[notifyKey]
+				last, _ := m.engine.GetLastNotified(alertID, notifyKey)
 				if !last.IsZero() && now.Sub(last) < repeatEvery {
 					continue
 				}
@@ -251,12 +257,7 @@ func (m *Manager) ResolveByTTL(ctx context.Context, alertID, reason string) erro
 	}
 	card.State = domain.AlertStateResolved
 	closedAt := m.clock.Now()
-	if card.RaisedAt.IsZero() {
-		card.RaisedAt = card.LastSeenAt
-		if card.RaisedAt.IsZero() {
-			card.RaisedAt = closedAt
-		}
-	}
+	resolveCardRaisedAt(&card, closedAt)
 	card.ClosedAt = &closedAt
 	card.ResolveCause = reason
 	if _, err := m.store.UpdateCard(ctx, alertID, revision, card); err != nil {
@@ -273,19 +274,7 @@ func (m *Manager) ResolveByTTL(ctx context.Context, alertID, reason string) erro
 	}
 	m.seedExternalRefs(alertID, card.ExternalRefs)
 
-	if notifyErr := m.dispatchNotification(ctx, rule, domain.Notification{
-		AlertID:     card.AlertID,
-		ShortID:     shortAlertID(card.AlertID),
-		RuleName:    card.RuleName,
-		Var:         card.Var,
-		Tags:        card.Tags,
-		State:       domain.AlertStateResolved,
-		Message:     m.notificationMessage(domain.AlertStateResolved, reason),
-		MetricValue: card.MetricValue,
-		StartedAt:   startedAt(card.RaisedAt, closedAt),
-		Duration:    alertDuration(card.RaisedAt, closedAt),
-		Timestamp:   closedAt,
-	}); notifyErr != nil {
+	if notifyErr := m.dispatchNotification(ctx, rule, buildResolvedCardNotification(card, m.notificationMessage(domain.AlertStateResolved, reason), closedAt)); notifyErr != nil {
 		m.logger.Error("resolved ttl notification failed", "alert_id", alertID, "error", notifyErr.Error())
 	}
 
@@ -338,25 +327,8 @@ func (m *Manager) cleanupRemovedRule(ctx context.Context, removedRule config.Rul
 		}
 		if card.State == domain.AlertStatePending || card.State == domain.AlertStateFiring {
 			m.seedExternalRefs(alertID, card.ExternalRefs)
-			if card.RaisedAt.IsZero() {
-				card.RaisedAt = card.LastSeenAt
-				if card.RaisedAt.IsZero() {
-					card.RaisedAt = now
-				}
-			}
-			notification := buildNotification(
-				card.AlertID,
-				card.RuleName,
-				card.Var,
-				card.Tags,
-				card.MetricValue,
-				domain.AlertStateResolved,
-				"resolved due rule removal",
-				now,
-				card.RaisedAt,
-			)
-			notification.Duration = alertDuration(card.RaisedAt, now)
-			_ = m.dispatchNotification(ctx, removedRule, notification)
+			resolveCardRaisedAt(&card, now)
+			_ = m.dispatchNotification(ctx, removedRule, buildResolvedCardNotification(card, "resolved due rule removal", now))
 		}
 		_ = m.store.DeleteCard(ctx, alertID)
 		m.engine.RemoveAlertState(alertID)
@@ -378,8 +350,6 @@ func (m *Manager) applyDecision(ctx context.Context, rule config.RuleConfig, ale
 	}
 	metricValue := identity.MetricValue
 	var raisedAt time.Time
-	var cardSnapshot domain.AlertCard
-	cardLoaded := false
 
 	if decision.ShouldStore && decision.State != domain.AlertStateResolved {
 		ttl := config.ResolveTimeout(rule)
@@ -397,45 +367,15 @@ func (m *Manager) applyDecision(ctx context.Context, rule config.RuleConfig, ale
 	shouldNotify := decision.ShouldNotify
 
 	if decision.StateChanged {
-		card, revision, err := m.store.GetCard(ctx, alertID)
+		writeResult, err := m.persistDecisionCard(ctx, rule, alertID, identity, metricValue, decision, now)
 		if err != nil {
-			if !errors.Is(err, state.ErrNotFound) {
-				return err
-			}
-			card = domain.AlertCard{
-				AlertID:     alertID,
-				RuleName:    rule.Name,
-				Var:         identity.Var,
-				Tags:        identity.Tags,
-				MetricValue: metricValue,
-				State:       decision.State,
-				RaisedAt:    now,
-				LastSeenAt:  now,
-			}
-			applyCardStateTransition(&card, decision.State, decision.ResolveCause, now)
-			if _, putErr := m.store.PutCard(ctx, alertID, card); putErr != nil {
-				return putErr
-			}
-		} else {
-			// Redelivery-safe guard: when persisted state already equals the target state,
-			// do not emit duplicated transition notifications.
-			if card.State == decision.State {
-				shouldNotify = false
-			}
-			card.LastSeenAt = now
-			card.State = decision.State
-			card.MetricValue = metricValue
-			applyCardStateTransition(&card, decision.State, decision.ResolveCause, now)
-			if _, updateErr := m.store.UpdateCard(ctx, alertID, revision, card); updateErr != nil && !errors.Is(updateErr, state.ErrConflict) {
-				return updateErr
-			}
+			return err
 		}
-		cardSnapshot = card
-		cardLoaded = true
-		raisedAt = card.RaisedAt
-	}
-	if cardLoaded {
-		m.seedExternalRefs(alertID, cardSnapshot.ExternalRefs)
+		shouldNotify = shouldNotify && writeResult.allowNotify
+		raisedAt = writeResult.card.RaisedAt
+		if writeResult.seedExtRefs {
+			m.seedExternalRefs(alertID, writeResult.card.ExternalRefs)
+		}
 	}
 
 	if shouldNotify && !(decision.State == domain.AlertStatePending && !m.notifyOnPending(rule)) {
@@ -475,6 +415,77 @@ func (m *Manager) flushTickRefresh(ctx context.Context, pendingTickRefresh map[s
 		}
 	}
 	return nil
+}
+
+// persistDecisionCard stores one transition with create/update CAS semantics and duplicate-send suppression on conflicts.
+// Params: rule context, alert identity, metric value, decision, and current time.
+// Returns: persisted/latest card snapshot and whether notification may still be emitted.
+func (m *Manager) persistDecisionCard(
+	ctx context.Context,
+	rule config.RuleConfig,
+	alertID string,
+	identity engine.AlertIdentity,
+	metricValue string,
+	decision domain.Decision,
+	now time.Time,
+) (cardWriteResult, error) {
+	eventCount := int64(0)
+	if runtimeState, exists := m.engine.GetStateSnapshot(alertID); exists {
+		eventCount = runtimeState.ActiveCount
+	}
+	card, revision, err := m.store.GetCard(ctx, alertID)
+	if err != nil {
+		if !errors.Is(err, state.ErrNotFound) {
+			return cardWriteResult{}, err
+		}
+		card = domain.AlertCard{
+			AlertID:     alertID,
+			RuleName:    rule.Name,
+			Var:         identity.Var,
+			Tags:        identity.Tags,
+			MetricValue: metricValue,
+			EventCount:  eventCount,
+			State:       decision.State,
+			RaisedAt:    now,
+			LastSeenAt:  now,
+		}
+		applyCardStateTransition(&card, decision.State, decision.ResolveCause, now)
+		if _, createErr := m.store.CreateCard(ctx, alertID, card); createErr != nil {
+			if !errors.Is(createErr, state.ErrConflict) {
+				return cardWriteResult{}, createErr
+			}
+			return m.resolvePersistConflict(ctx, alertID)
+		}
+		return cardWriteResult{card: card, allowNotify: true, seedExtRefs: true}, nil
+	}
+
+	allowNotify := card.State != decision.State
+	card.LastSeenAt = now
+	card.State = decision.State
+	card.MetricValue = metricValue
+	card.EventCount = eventCount
+	applyCardStateTransition(&card, decision.State, decision.ResolveCause, now)
+	if _, updateErr := m.store.UpdateCard(ctx, alertID, revision, card); updateErr != nil {
+		if !errors.Is(updateErr, state.ErrConflict) {
+			return cardWriteResult{}, updateErr
+		}
+		return m.resolvePersistConflict(ctx, alertID)
+	}
+	return cardWriteResult{card: card, allowNotify: allowNotify, seedExtRefs: true}, nil
+}
+
+// resolvePersistConflict reloads latest card snapshot after CAS conflict and suppresses duplicate transition notifications.
+// Params: alert id whose card was concurrently updated.
+// Returns: latest card snapshot or empty snapshot when card disappeared.
+func (m *Manager) resolvePersistConflict(ctx context.Context, alertID string) (cardWriteResult, error) {
+	card, _, err := m.store.GetCard(ctx, alertID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return cardWriteResult{allowNotify: false}, nil
+		}
+		return cardWriteResult{}, err
+	}
+	return cardWriteResult{card: card, allowNotify: false, seedExtRefs: true}, nil
 }
 
 // sortedRulesLocked returns active rules in deterministic order.
@@ -586,34 +597,20 @@ func (m *Manager) notifyRoutes(ctx context.Context, notification domain.Notifica
 	if dispatcher == nil {
 		return nil, nil
 	}
-	if len(routes) == 0 {
-		return nil, nil
-	}
 	results := make([]routeSendResult, 0, len(routes))
-	for _, route := range routes {
-		normalizedRoute, ok := normalizedRouteFromRuntimeRoute(route)
-		if !ok {
-			continue
-		}
-		perRoute, ok := m.prepareNotificationForRoute(notification, normalizedRoute)
-		if !ok {
-			continue
-		}
-		if dropTrackerWithoutRef &&
-			perRoute.State == domain.AlertStateResolved &&
-			(normalizedRoute.Channel == config.NotifyChannelJira || normalizedRoute.Channel == config.NotifyChannelYouTrack) &&
-			strings.TrimSpace(perRoute.ExternalRef) == "" {
-			m.logger.Warn("drop tracker resolved notification without external ref", "channel", normalizedRoute.Channel, "alert_id", perRoute.AlertID)
-			continue
-		}
-		result, err := dispatcher.Send(ctx, normalizedRoute.Channel, normalizedRoute.Template, perRoute)
+	err := m.forEachRouteNotification(notification, routes, dropTrackerWithoutRef, func(route normalizedNotifyRoute, perRoute domain.Notification) error {
+		result, err := dispatcher.Send(ctx, route.Channel, route.Template, perRoute)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		results = append(results, routeSendResult{
-			Route:  normalizedRoute,
+			Route:  route,
 			Result: result,
 		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return results, nil
 }
@@ -695,12 +692,12 @@ func (m *Manager) dispatchNotification(ctx context.Context, rule config.RuleConf
 // Params: queued delivery job produced by manager enqueue path.
 // Returns: delivery error for worker NAK/redelivery.
 func (m *Manager) ProcessQueuedNotification(ctx context.Context, job notifyqueue.Job) error {
-	normalizedRoute, ok := normalizedRouteFromRuntimeRoute(config.RuleNotifyRoute{
+	normalizedRoute, ok := normalizedNotifyRouteFromConfig(config.RuleNotifyRoute{
 		Name:     job.RouteKey,
 		Channel:  job.Channel,
 		Template: job.Template,
 		Mode:     job.RouteMode,
-	})
+	}, true)
 	if !ok {
 		return nil
 	}
@@ -737,80 +734,93 @@ func (m *Manager) enqueueNotificationJobs(ctx context.Context, producer notifyqu
 	}
 	success := 0
 	var firstErr error
-	for _, route := range routes {
-		normalizedRoute, ok := normalizedRouteFromRuntimeRoute(route)
-		if !ok {
-			continue
-		}
-		perRoute, ok := m.prepareNotificationForRoute(notification, normalizedRoute)
-		if !ok {
-			continue
-		}
+	_ = m.forEachRouteNotification(notification, routes, false, func(route normalizedNotifyRoute, perRoute domain.Notification) error {
 		job := notifyqueue.Job{
-			ID:           notifyqueue.BuildJobID(normalizedRoute.Channel, normalizedRoute.Template, perRoute),
-			RouteKey:     normalizedRoute.Key,
-			RouteMode:    normalizedRoute.Mode,
-			Channel:      normalizedRoute.Channel,
-			Template:     normalizedRoute.Template,
+			ID:           notifyqueue.BuildJobID(route.Channel, route.Template, perRoute),
+			RouteKey:     route.Key,
+			RouteMode:    route.Mode,
+			Channel:      route.Channel,
+			Template:     route.Template,
 			Notification: perRoute,
 			CreatedAt:    m.clock.Now(),
 		}
 		if err := producer.Enqueue(ctx, job); err != nil {
-			m.logger.Error("enqueue notification failed", "channel", normalizedRoute.Channel, "route_key", normalizedRoute.Key, "alert_id", perRoute.AlertID, "error", err.Error())
+			m.logger.Error("enqueue notification failed", "channel", route.Channel, "route_key", route.Key, "alert_id", perRoute.AlertID, "error", err.Error())
 			if firstErr == nil {
 				firstErr = err
 			}
-			continue
+			return nil
 		}
 		success++
-	}
+		return nil
+	})
 	if success == 0 && firstErr != nil {
 		return firstErr
 	}
 	return nil
 }
 
-// normalizeNotifyRoute normalizes route fields and validates required values.
-// Params: raw route config.
+// forEachRouteNotification executes callback per sendable route-scoped notification.
+func (m *Manager) forEachRouteNotification(notification domain.Notification, routes []config.RuleNotifyRoute, dropTrackerWithoutRef bool, fn func(normalizedNotifyRoute, domain.Notification) error) error {
+	for _, route := range routes {
+		normalizedRoute, ok := normalizedNotifyRouteFromConfig(route, true)
+		if !ok {
+			continue
+		}
+		perRoute, ok := m.prepareNotificationForRoute(notification, normalizedRoute)
+		if !ok || m.shouldDropTrackerNotification(dropTrackerWithoutRef, normalizedRoute, perRoute) {
+			continue
+		}
+		if err := fn(normalizedRoute, perRoute); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// shouldDropTrackerNotification suppresses tracker resolve sends without external refs.
+func (m *Manager) shouldDropTrackerNotification(dropTrackerWithoutRef bool, route normalizedNotifyRoute, notification domain.Notification) bool {
+	if !dropTrackerWithoutRef ||
+		notification.State != domain.AlertStateResolved ||
+		(route.Channel != config.NotifyChannelJira && route.Channel != config.NotifyChannelYouTrack) ||
+		strings.TrimSpace(notification.ExternalRef) != "" {
+		return false
+	}
+	m.logger.Warn("drop tracker resolved notification without external ref", "channel", route.Channel, "alert_id", notification.AlertID)
+	return true
+}
+
+// normalizedNotifyRouteFromConfig normalizes route fields and optionally trusts pre-normalized runtime values.
+// Params: route config and flag indicating whether runtime normalization already happened.
 // Returns: normalized route descriptor and validity flag.
-func normalizeNotifyRoute(route config.RuleNotifyRoute) (normalizedNotifyRoute, bool) {
-	channel := strings.ToLower(strings.TrimSpace(route.Channel))
+func normalizedNotifyRouteFromConfig(route config.RuleNotifyRoute, alreadyNormalized bool) (normalizedNotifyRoute, bool) {
+	channel := strings.TrimSpace(route.Channel)
 	templateName := strings.TrimSpace(route.Template)
 	if channel == "" || templateName == "" {
 		return normalizedNotifyRoute{}, false
 	}
-	routeKey := strings.ToLower(strings.TrimSpace(route.Name))
+	if !alreadyNormalized {
+		channel = strings.ToLower(channel)
+	}
+	routeKey := strings.TrimSpace(route.Name)
+	if !alreadyNormalized {
+		routeKey = strings.ToLower(routeKey)
+	}
 	if routeKey == "" {
 		routeKey = channel
 	}
-	mode := config.NormalizeNotifyRouteMode(route.Mode)
+	mode := strings.TrimSpace(route.Mode)
+	if alreadyNormalized {
+		if mode == "" {
+			mode = config.NotifyRouteModeHistory
+		}
+	} else {
+		mode = config.NormalizeNotifyRouteMode(mode)
+	}
 	return normalizedNotifyRoute{
 		Key:      routeKey,
 		Channel:  channel,
 		Template: templateName,
-		Mode:     mode,
-	}, true
-}
-
-// normalizedRouteFromRuntimeRoute converts already-normalized runtime route into descriptor.
-// Params: route config from in-memory normalized rule set.
-// Returns: route descriptor and validity flag for required fields.
-func normalizedRouteFromRuntimeRoute(route config.RuleNotifyRoute) (normalizedNotifyRoute, bool) {
-	if route.Channel == "" || route.Template == "" {
-		return normalizedNotifyRoute{}, false
-	}
-	routeKey := route.Name
-	if routeKey == "" {
-		routeKey = route.Channel
-	}
-	mode := route.Mode
-	if mode == "" {
-		mode = config.NotifyRouteModeHistory
-	}
-	return normalizedNotifyRoute{
-		Key:      routeKey,
-		Channel:  route.Channel,
-		Template: route.Template,
 		Mode:     mode,
 	}, true
 }
@@ -887,13 +897,11 @@ func isPermanentNotifyError(err error) bool {
 // Params: notification payload and per-route send results.
 // Returns: persistence error for external refs only.
 func (m *Manager) applyDeliveryResults(ctx context.Context, notification domain.Notification, results []routeSendResult) error {
-	m.captureOpeningTelegramMessageID(notification.AlertID, notification.State, results)
-	m.captureExternalRefs(notification.AlertID, results)
-	m.captureLastNotified(notification.AlertID, notification.Timestamp, results)
-	if notification.State == domain.AlertStateResolved {
+	updates := m.captureDeliveryEffects(notification, results)
+	if notification.State == domain.AlertStateResolved || len(updates) == 0 {
 		return nil
 	}
-	return m.persistExternalRefs(ctx, notification.AlertID, results)
+	return m.persistExternalRefs(ctx, notification.AlertID, updates)
 }
 
 // ruleByName resolves one active rule by name under read lock.
@@ -906,45 +914,45 @@ func (m *Manager) ruleByName(name string) (config.RuleConfig, bool) {
 	return rule, ok
 }
 
-// captureOpeningTelegramMessageID stores first Telegram message id for alert lifecycle threading.
-// Params: alert id, notification state, and per-channel send results.
-// Returns: runtime state updated only for first active Telegram message.
-func (m *Manager) captureOpeningTelegramMessageID(alertID string, stateValue domain.AlertState, results []routeSendResult) {
-	if stateValue != domain.AlertStatePending && stateValue != domain.AlertStateFiring {
-		return
-	}
-	for _, entry := range results {
-		if entry.Route.Channel != config.NotifyChannelTelegram {
-			continue
-		}
-		if entry.Route.Mode == config.NotifyRouteModeActiveOnly {
-			continue
-		}
-		if entry.Result.MessageID <= 0 {
-			continue
-		}
-		_, exists := m.engine.GetChannelMessageID(alertID, entry.Route.Key)
-		if exists {
-			continue
-		}
-		m.engine.SetChannelMessageID(alertID, entry.Route.Key, entry.Result.MessageID)
-	}
+// GetStateSnapshot returns one runtime engine state copy for UI/diagnostics.
+// Params: alert ID.
+// Returns: detached runtime state copy and existence flag.
+func (m *Manager) GetStateSnapshot(alertID string) (engine.RuntimeState, bool) {
+	return m.engine.GetStateSnapshot(alertID)
 }
 
-// captureExternalRefs stores external issue references from send results in runtime state.
-// Params: alert id and per-channel send results.
-// Returns: runtime external refs updated for channels that returned non-empty refs.
-func (m *Manager) captureExternalRefs(alertID string, results []routeSendResult) {
+// captureDeliveryEffects updates runtime delivery side effects and returns refs to persist.
+func (m *Manager) captureDeliveryEffects(notification domain.Notification, results []routeSendResult) map[string]string {
 	if len(results) == 0 {
-		return
+		return nil
 	}
+	repeatPerChannel := m.repeatPerChannel()
+	var updates map[string]string
 	for _, entry := range results {
-		externalRef := strings.TrimSpace(entry.Result.ExternalRef)
-		if externalRef == "" {
-			continue
+		if notification.State != domain.AlertStateResolved &&
+			entry.Route.Channel == config.NotifyChannelTelegram &&
+			entry.Route.Mode != config.NotifyRouteModeActiveOnly &&
+			entry.Result.MessageID > 0 {
+			if _, exists := m.engine.GetChannelMessageID(notification.AlertID, entry.Route.Key); !exists {
+				m.engine.SetChannelMessageID(notification.AlertID, entry.Route.Key, entry.Result.MessageID)
+			}
 		}
-		m.engine.SetChannelExternalRef(alertID, entry.Route.Key, externalRef)
+
+		if externalRef := strings.TrimSpace(entry.Result.ExternalRef); externalRef != "" {
+			m.engine.SetChannelExternalRef(notification.AlertID, entry.Route.Key, externalRef)
+			if updates == nil {
+				updates = make(map[string]string)
+			}
+			updates[entry.Route.Key] = externalRef
+		}
+
+		notifyKey := entry.Route.Key
+		if !repeatPerChannel {
+			notifyKey = "global"
+		}
+		m.engine.SetLastNotified(notification.AlertID, notifyKey, notification.Timestamp)
 	}
+	return updates
 }
 
 // seedExternalRefs copies persisted channel refs into runtime state.
@@ -964,20 +972,9 @@ func (m *Manager) seedExternalRefs(alertID string, refs map[string]string) {
 }
 
 // persistExternalRefs stores external issue references in alert card for restart-safe resolve path.
-// Params: alert id and per-channel send results with external refs.
+// Params: alert id and route-key external ref updates.
 // Returns: persistence error when card update fails.
-func (m *Manager) persistExternalRefs(ctx context.Context, alertID string, results []routeSendResult) error {
-	if len(results) == 0 {
-		return nil
-	}
-	updates := make(map[string]string)
-	for _, entry := range results {
-		externalRef := strings.TrimSpace(entry.Result.ExternalRef)
-		if externalRef == "" {
-			continue
-		}
-		updates[entry.Route.Key] = externalRef
-	}
+func (m *Manager) persistExternalRefs(ctx context.Context, alertID string, updates map[string]string) error {
 	if len(updates) == 0 {
 		return nil
 	}
@@ -1017,23 +1014,6 @@ func (m *Manager) persistExternalRefs(ctx context.Context, alertID string, resul
 	return fmt.Errorf("persist external refs conflict retries exceeded for %s", alertID)
 }
 
-// captureLastNotified stores notification timestamp for repeat scheduler keys.
-// Params: alert id, send time, and sent-channel results.
-// Returns: runtime state markers updated for delivered channels.
-func (m *Manager) captureLastNotified(alertID string, now time.Time, results []routeSendResult) {
-	if len(results) == 0 {
-		return
-	}
-	repeatPerChannel := m.repeatPerChannel()
-	for _, entry := range results {
-		notifyKey := entry.Route.Key
-		if !repeatPerChannel {
-			notifyKey = "global"
-		}
-		m.engine.SetLastNotified(alertID, notifyKey, now)
-	}
-}
-
 // applyCardStateTransition updates state-specific card fields for pending/firing/resolved.
 // Params: mutable card pointer, target state, optional resolve cause, and transition time.
 // Returns: card updated in place.
@@ -1055,6 +1035,17 @@ func applyCardStateTransition(card *domain.AlertCard, stateValue domain.AlertSta
 	}
 }
 
+// resolveCardRaisedAt backfills missing raise time from last-seen or current timestamp.
+func resolveCardRaisedAt(card *domain.AlertCard, fallback time.Time) {
+	if !card.RaisedAt.IsZero() {
+		return
+	}
+	card.RaisedAt = card.LastSeenAt
+	if card.RaisedAt.IsZero() {
+		card.RaisedAt = fallback
+	}
+}
+
 // buildNotification assembles base notification payload with consistent fields.
 // Params: alert identity, state, message, timestamps.
 // Returns: populated notification payload.
@@ -1071,6 +1062,13 @@ func buildNotification(alertID, ruleName, varName string, tags map[string]string
 		StartedAt:   startedAt(raisedAt, now),
 		Timestamp:   now,
 	}
+}
+
+// buildResolvedCardNotification assembles a resolved notification from persisted card data.
+func buildResolvedCardNotification(card domain.AlertCard, message string, now time.Time) domain.Notification {
+	notification := buildNotification(card.AlertID, card.RuleName, card.Var, card.Tags, card.MetricValue, domain.AlertStateResolved, message, now, card.RaisedAt)
+	notification.Duration = alertDuration(card.RaisedAt, now)
+	return notification
 }
 
 // shortAlertID builds compact human-friendly alert identifier.
@@ -1144,7 +1142,7 @@ func normalizeRule(rule config.RuleConfig) config.RuleConfig {
 	if len(rule.Notify.Route) > 0 {
 		normalizedRoutes := make([]config.RuleNotifyRoute, 0, len(rule.Notify.Route))
 		for _, route := range rule.Notify.Route {
-			normalizedRoute, ok := normalizeNotifyRoute(route)
+			normalizedRoute, ok := normalizedNotifyRouteFromConfig(route, false)
 			if !ok {
 				continue
 			}
@@ -1156,6 +1154,15 @@ func normalizeRule(rule config.RuleConfig) config.RuleConfig {
 			})
 		}
 		rule.Notify.Route = normalizedRoutes
+	}
+	if len(rule.Notify.Off) > 0 {
+		for i := range rule.Notify.Off {
+			compiled, err := config.CompileNotifyOffWindow(rule.Notify.Off[i])
+			if err != nil {
+				continue
+			}
+			rule.Notify.Off[i].SetCompiled(compiled)
+		}
 	}
 	return rule
 }

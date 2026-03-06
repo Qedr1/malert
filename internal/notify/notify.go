@@ -554,7 +554,7 @@ func (s *HTTPScenarioSender) Send(ctx context.Context, notification domain.Notif
 		request.Header.Set(key, value)
 	}
 
-	if _, err := executeRequest(s.client, request, "http notify", nil); err != nil {
+	if _, err := executeRequest(s.client, request, "http notify", nil, false); err != nil {
 		return SendResult{}, err
 	}
 	return SendResult{}, nil
@@ -681,7 +681,7 @@ func (s *MattermostSender) createPost(ctx context.Context, payload any) (struct 
 		return empty, err
 	}
 	s.applyAuth(request)
-	responseBody, err := executeRequest(s.client, request, "mattermost", nil)
+	responseBody, err := executeRequest(s.client, request, "mattermost", nil, true)
 	if err != nil {
 		return empty, err
 	}
@@ -713,7 +713,7 @@ func (s *MattermostSender) updatePost(ctx context.Context, postID, message strin
 		return err
 	}
 	s.applyAuth(request)
-	if _, err := executeRequest(s.client, request, "mattermost", nil); err != nil {
+	if _, err := executeRequest(s.client, request, "mattermost", nil, false); err != nil {
 		return err
 	}
 	return nil
@@ -728,7 +728,7 @@ func (s *MattermostSender) deletePost(ctx context.Context, postID string) error 
 		return fmt.Errorf("build mattermost delete request: %w", err)
 	}
 	s.applyAuth(request)
-	if _, err := executeRequest(s.client, request, "mattermost", nil); err != nil {
+	if _, err := executeRequest(s.client, request, "mattermost", nil, false); err != nil {
 		return err
 	}
 	return nil
@@ -775,9 +775,9 @@ func buildJSONRequest(ctx context.Context, method, endpoint string, payload any,
 }
 
 // executeRequest sends request and validates response status.
-// Params: HTTP client, request, error prefix, and optional accepted status set (nil => any 2xx).
-// Returns: full response body for successful status.
-func executeRequest(client *http.Client, request *http.Request, prefix string, successStatus map[int]struct{}) ([]byte, error) {
+// Params: HTTP client, request, error prefix, accepted status set, and success-body flag.
+// Returns: response body only when caller requested it for successful status or when error formatting needs it.
+func executeRequest(client *http.Client, request *http.Request, prefix string, successStatus map[int]struct{}, readSuccessBody bool) ([]byte, error) {
 	if client == nil {
 		return nil, fmt.Errorf("%s client is nil", prefix)
 	}
@@ -787,14 +787,24 @@ func executeRequest(client *http.Client, request *http.Request, prefix string, s
 	}
 	defer response.Body.Close()
 
+	if isHTTPStatusAccepted(response.StatusCode, successStatus) {
+		if !readSuccessBody {
+			if _, err := io.Copy(io.Discard, response.Body); err != nil {
+				return nil, fmt.Errorf("%s discard response: %w", prefix, err)
+			}
+			return nil, nil
+		}
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			return nil, fmt.Errorf("%s read response: %w", prefix, err)
+		}
+		return body, nil
+	}
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		return nil, fmt.Errorf("%s read response: %w", prefix, err)
 	}
-	if !isHTTPStatusAccepted(response.StatusCode, successStatus) {
-		return nil, formatHTTPStatusError(prefix, response.StatusCode, body)
-	}
-	return body, nil
+	return nil, formatHTTPStatusError(prefix, response.StatusCode, body)
 }
 
 // isHTTPStatusAccepted checks status against optional explicit allow list.
@@ -957,7 +967,7 @@ func (s *TrackerSender) executeAction(ctx context.Context, action trackerActionR
 	}
 	applyTrackerAuth(request, s.cfg.Auth)
 
-	responseBody, err := executeRequest(s.client, request, "tracker "+s.channel, action.successStatus)
+	responseBody, err := executeRequest(s.client, request, "tracker "+s.channel, action.successStatus, strings.TrimSpace(action.responseRefKey) != "")
 	if err != nil {
 		return SendResult{}, err
 	}
